@@ -1112,6 +1112,7 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		// been closed so we'll ignore it.
 		chanUtxo, err := r.cfg.Chain.GetUtxo(
 			fundingPoint, fundingPkScript, channelID.BlockHeight,
+			r.quit,
 		)
 		if err != nil {
 			r.rejectMtx.Lock()
