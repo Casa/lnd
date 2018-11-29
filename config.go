@@ -592,16 +592,10 @@ func loadConfig() (*config, error) {
 			"litecoin.active must be set to 1 (true)", funcName)
 
 	case cfg.Litecoin.Active:
-		if cfg.Litecoin.RegTest {
-			str := "%s: regnet mode for litecoin not currently supported"
-			return nil, fmt.Errorf(str, funcName)
-		}
-
 		if cfg.Litecoin.TimeLockDelta < minTimeLockDelta {
 			return nil, fmt.Errorf("timelockdelta must be at least %v",
 				minTimeLockDelta)
 		}
-
 		// Multiple networks can't be selected simultaneously.  Count
 		// number of network flags passed; assign active network params
 		// while we're at it.
@@ -619,6 +613,15 @@ func loadConfig() (*config, error) {
 			numNets++
 			ltcParams = litecoinSimNetParams
 		}
+		if cfg.Litecoin.RegTest {
+			numNets++
+			ltcParams = litecoinRegTestNetParams
+		}
+		if cfg.Litecoin.SimNet {
+			numNets++
+			ltcParams = litecoinSimNetParams
+		}
+
 		if numNets > 1 {
 			str := "%s: The mainnet, testnet, and simnet params " +
 				"can't be used together -- choose one of the " +
@@ -701,7 +704,7 @@ func loadConfig() (*config, error) {
 		}
 		if cfg.Bitcoin.RegTest {
 			numNets++
-			activeNetParams = regTestNetParams
+			activeNetParams = bitcoinRegTestNetParams
 		}
 		if cfg.Bitcoin.SimNet {
 			numNets++
