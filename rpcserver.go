@@ -1,4 +1,4 @@
-package main
+package lnd
 
 import (
 	"bytes"
@@ -911,6 +911,15 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 		return nil, fmt.Errorf("address: %v is not valid for this "+
 			"network: %v", targetAddr.String(),
 			activeNetParams.Params.Name)
+	}
+
+	// If the destination address parses to a valid pubkey, we assume the user
+	// accidently tried to send funds to a bare pubkey address. This check is
+	// here to prevent unintended transfers.
+	decodedAddr, _ := hex.DecodeString(in.Addr)
+	_, err = btcec.ParsePubKey(decodedAddr, btcec.S256())
+	if err == nil {
+		return nil, fmt.Errorf("cannot send coins to pubkeys")
 	}
 
 	var txid *chainhash.Hash

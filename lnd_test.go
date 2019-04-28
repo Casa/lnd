@@ -1,6 +1,6 @@
 // +build rpctest
 
-package main
+package lnd
 
 import (
 	"bytes"
@@ -576,10 +576,20 @@ func calcStaticFee(numHTLCs int) btcutil.Amount {
 func completePaymentRequests(ctx context.Context, client lnrpc.LightningClient,
 	paymentRequests []string, awaitResponse bool) error {
 
-	ctx, cancel := context.WithCancel(ctx)
+	// We start by getting the current state of the client's channels. This
+	// is needed to ensure the payments actually have been committed before
+	// we return.
+	ctxt, _ := context.WithTimeout(ctx, defaultTimeout)
+	req := &lnrpc.ListChannelsRequest{}
+	listResp, err := client.ListChannels(ctxt, req)
+	if err != nil {
+		return err
+	}
+
+	ctxc, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	payStream, err := client.SendPayment(ctx)
+	payStream, err := client.SendPayment(ctxc)
 	if err != nil {
 		return err
 	}
@@ -605,11 +615,40 @@ func completePaymentRequests(ctx context.Context, client lnrpc.LightningClient,
 					resp.PaymentError)
 			}
 		}
-	} else {
-		// We are not waiting for feedback in the form of a response, but we
-		// should still wait long enough for the server to receive and handle
-		// the send before cancelling the request.
-		time.Sleep(200 * time.Millisecond)
+
+		return nil
+	}
+
+	// We are not waiting for feedback in the form of a response, but we
+	// should still wait long enough for the server to receive and handle
+	// the send before cancelling the request. We wait for the number of
+	// updates to one of our channels has increased before we return.
+	err = lntest.WaitPredicate(func() bool {
+		ctxt, _ = context.WithTimeout(ctx, defaultTimeout)
+		newListResp, err := client.ListChannels(ctxt, req)
+		if err != nil {
+			return false
+		}
+
+		for _, c1 := range listResp.Channels {
+			for _, c2 := range newListResp.Channels {
+				if c1.ChannelPoint != c2.ChannelPoint {
+					continue
+				}
+
+				// If this channel has an increased numbr of
+				// updates, we assume the payments are
+				// committed, and we can return.
+				if c2.NumUpdates > c1.NumUpdates {
+					return true
+				}
+			}
+		}
+
+		return false
+	}, time.Second*15)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -7945,16 +7984,25 @@ func testDataLossProtection(net *lntest.NetworkHarness, t *harnessTest) {
 	mineBlocks(t, net, 1, 1)
 	assertNodeNumChannels(t, dave, 0)
 
-	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	daveBalResp, err := dave.WalletBalance(ctxt, balReq)
-	if err != nil {
-		t.Fatalf("unable to get dave's balance: %v", err)
-	}
+	err = lntest.WaitNoError(func() error {
+		ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+		daveBalResp, err := dave.WalletBalance(ctxt, balReq)
+		if err != nil {
+			return fmt.Errorf("unable to get dave's balance: %v",
+				err)
+		}
 
-	daveBalance := daveBalResp.ConfirmedBalance
-	if daveBalance <= daveStartingBalance {
-		t.Fatalf("expected dave to have balance above %d, intead had %v",
-			daveStartingBalance, daveBalance)
+		daveBalance := daveBalResp.ConfirmedBalance
+		if daveBalance <= daveStartingBalance {
+			return fmt.Errorf("expected dave to have balance "+
+				"above %d, intead had %v", daveStartingBalance,
+				daveBalance)
+		}
+
+		return nil
+	}, time.Second*15)
+	if err != nil {
+		t.Fatalf("%v", err)
 	}
 }
 
@@ -13044,6 +13092,36 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 		t.Fatalf("unable to send coins to eve: %v", err)
 	}
 
+	// Ensure that we can't send coins to our own Pubkey.
+	info, err := ainz.GetInfo(ctxt, &lnrpc.GetInfoRequest{})
+	if err != nil {
+		t.Fatalf("unable to get node info: %v", err)
+	}
+
+	sweepReq := &lnrpc.SendCoinsRequest{
+		Addr:    info.IdentityPubkey,
+		SendAll: true,
+	}
+	_, err = ainz.SendCoins(ctxt, sweepReq)
+	if err == nil {
+		t.Fatalf("expected SendCoins to users own pubkey to fail")
+	}
+
+	// Ensure that we can't send coins to another users Pubkey.
+	info, err = net.Alice.GetInfo(ctxt, &lnrpc.GetInfoRequest{})
+	if err != nil {
+		t.Fatalf("unable to get node info: %v", err)
+	}
+
+	sweepReq = &lnrpc.SendCoinsRequest{
+		Addr:    info.IdentityPubkey,
+		SendAll: true,
+	}
+	_, err = ainz.SendCoins(ctxt, sweepReq)
+	if err == nil {
+		t.Fatalf("expected SendCoins to Alices pubkey to fail")
+	}
+
 	// With the two coins above mined, we'll now instruct ainz to sweep all
 	// the coins to an external address not under its control.
 	// We will first attempt to send the coins to addresses that are not
@@ -13053,7 +13131,7 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// Send coins to a testnet3 address.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	sweepReq := &lnrpc.SendCoinsRequest{
+	sweepReq = &lnrpc.SendCoinsRequest{
 		Addr:    "tb1qfc8fusa98jx8uvnhzavxccqlzvg749tvjw82tg",
 		SendAll: true,
 	}
