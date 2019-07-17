@@ -150,7 +150,9 @@ func Main() error {
 	if cfg.CPUProfile != "" {
 		f, err := os.Create(cfg.CPUProfile)
 		if err != nil {
-			ltndLog.Errorf("Unable to create cpu profile: %v", err)
+			err := fmt.Errorf("Unable to create CPU profile: %v",
+				err)
+			ltndLog.Error(err)
 			return err
 		}
 		pprof.StartCPUProfile(f)
@@ -171,7 +173,8 @@ func Main() error {
 		channeldb.OptionSetChannelCacheSize(cfg.Caches.ChannelCacheSize),
 	)
 	if err != nil {
-		ltndLog.Errorf("unable to open channeldb: %v", err)
+		err := fmt.Errorf("Unable to open channeldb: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 	defer chanDB.Close()
@@ -187,6 +190,8 @@ func Main() error {
 		cfg.RPCListeners,
 	)
 	if err != nil {
+		err := fmt.Errorf("Unable to load TLS credentials: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 
@@ -208,6 +213,9 @@ func Main() error {
 			mainChain.ChainDir,
 		)
 		if err != nil {
+			err := fmt.Errorf("Unable to initialize neutrino "+
+				"backend: %v", err)
+			ltndLog.Error(err)
 			return err
 		}
 		defer neutrinoCleanUp()
@@ -234,6 +242,9 @@ func Main() error {
 			restDialOpts, restProxyDest, tlsCfg,
 		)
 		if err != nil {
+			err := fmt.Errorf("Unable to set up wallet password "+
+				"listeners: %v", err)
+			ltndLog.Error(err)
 			return err
 		}
 
@@ -255,7 +266,9 @@ func Main() error {
 			networkDir, macaroons.IPLockChecker,
 		)
 		if err != nil {
-			srvrLog.Errorf("unable to create macaroon service: %v", err)
+			err := fmt.Errorf("Unable to set up macaroon "+
+				"authentication: %v", err)
+			ltndLog.Error(err)
 			return err
 		}
 		defer macaroonService.Close()
@@ -263,7 +276,8 @@ func Main() error {
 		// Try to unlock the macaroon store with the private password.
 		err = macaroonService.CreateUnlock(&privateWalletPw)
 		if err != nil {
-			srvrLog.Errorf("unable to unlock macaroons: %v", err)
+			err := fmt.Errorf("Unable to unlock macaroons: %v", err)
+			ltndLog.Error(err)
 			return err
 		}
 
@@ -276,8 +290,9 @@ func Main() error {
 				cfg.ReadMacPath, cfg.InvoiceMacPath,
 			)
 			if err != nil {
-				ltndLog.Errorf("unable to create macaroon "+
-					"files: %v", err)
+				err := fmt.Errorf("Unable to create macaroons "+
+					"%v", err)
+				ltndLog.Error(err)
 				return err
 			}
 		}
@@ -292,7 +307,8 @@ func Main() error {
 		walletInitParams.Wallet, neutrinoCS,
 	)
 	if err != nil {
-		fmt.Printf("unable to create chain control: %v\n", err)
+		err := fmt.Errorf("Unable to create chain control: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 
@@ -310,6 +326,8 @@ func Main() error {
 		},
 	})
 	if err != nil {
+		err := fmt.Errorf("Unable to derive node private key: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 	idPrivKey.Curve = btcec.S256()
@@ -327,7 +345,10 @@ func Main() error {
 		var err error
 		towerClientDB, err = wtdb.OpenClientDB(graphDir)
 		if err != nil {
-			ltndLog.Errorf("Unable to open watchtower client db: %v", err)
+			err := fmt.Errorf("Unable to open watchtower client "+
+				"database: %v", err)
+			ltndLog.Error(err)
+			return err
 		}
 		defer towerClientDB.Close()
 	}
@@ -343,7 +364,9 @@ func Main() error {
 
 		towerDB, err := wtdb.OpenTowerDB(towerDBDir)
 		if err != nil {
-			ltndLog.Errorf("Unable to open watchtower db: %v", err)
+			err := fmt.Errorf("Unable to open watchtower "+
+				"database: %v", err)
+			ltndLog.Error(err)
 			return err
 		}
 		defer towerDB.Close()
@@ -357,6 +380,9 @@ func Main() error {
 			},
 		)
 		if err != nil {
+			err := fmt.Errorf("Unable to derive watchtower "+
+				"private key: %v", err)
+			ltndLog.Error(err)
 			return err
 		}
 
@@ -375,13 +401,16 @@ func Main() error {
 			ChainHash:   *activeNetParams.GenesisHash,
 		}, lncfg.NormalizeAddresses)
 		if err != nil {
-			ltndLog.Errorf("Unable to configure watchtower: %v", err)
+			err := fmt.Errorf("Unable to configure watchtower: %v",
+				err)
+			ltndLog.Error(err)
 			return err
 		}
 
 		tower, err = watchtower.New(wtConfig)
 		if err != nil {
-			ltndLog.Errorf("Unable to create watchtower: %v", err)
+			err := fmt.Errorf("Unable to create watchtower: %v", err)
+			ltndLog.Error(err)
 			return err
 		}
 	}
@@ -393,7 +422,8 @@ func Main() error {
 		idPrivKey, walletInitParams.ChansToRestore,
 	)
 	if err != nil {
-		srvrLog.Errorf("unable to create server: %v\n", err)
+		err := fmt.Errorf("Unable to create server: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 
@@ -402,17 +432,20 @@ func Main() error {
 	// it at will.
 	atplCfg, err := initAutoPilot(server, cfg.Autopilot)
 	if err != nil {
-		ltndLog.Errorf("unable to init autopilot: %v", err)
+		err := fmt.Errorf("Unable to initialize autopilot: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 
 	atplManager, err := autopilot.NewManager(atplCfg)
 	if err != nil {
-		ltndLog.Errorf("unable to create autopilot manager: %v", err)
+		err := fmt.Errorf("Unable to create autopilot manager: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 	if err := atplManager.Start(); err != nil {
-		ltndLog.Errorf("unable to start autopilot manager: %v", err)
+		err := fmt.Errorf("Unable to start autopilot manager: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 	defer atplManager.Stop()
@@ -425,10 +458,13 @@ func Main() error {
 		tower, tlsCfg,
 	)
 	if err != nil {
-		srvrLog.Errorf("unable to start RPC server: %v", err)
+		err := fmt.Errorf("Unable to create RPC server: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 	if err := rpcServer.Start(); err != nil {
+		err := fmt.Errorf("Unable to start RPC server: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 	defer rpcServer.Stop()
@@ -440,6 +476,9 @@ func Main() error {
 	if !(cfg.Bitcoin.SimNet || cfg.Litecoin.SimNet) {
 		_, bestHeight, err := activeChainControl.chainIO.GetBestBlock()
 		if err != nil {
+			err := fmt.Errorf("Unable to determine chain tip: %v",
+				err)
+			ltndLog.Error(err)
 			return err
 		}
 
@@ -453,6 +492,9 @@ func Main() error {
 
 			synced, _, err := activeChainControl.wallet.IsSynced()
 			if err != nil {
+				err := fmt.Errorf("Unable to determine if "+
+					"wallet is synced: %v", err)
+				ltndLog.Error(err)
 				return err
 			}
 
@@ -465,6 +507,9 @@ func Main() error {
 
 		_, bestHeight, err = activeChainControl.chainIO.GetBestBlock()
 		if err != nil {
+			err := fmt.Errorf("Unable to determine chain tip: %v",
+				err)
+			ltndLog.Error(err)
 			return err
 		}
 
@@ -475,7 +520,8 @@ func Main() error {
 	// With all the relevant chains initialized, we can finally start the
 	// server itself.
 	if err := server.Start(); err != nil {
-		srvrLog.Errorf("unable to start server: %v\n", err)
+		err := fmt.Errorf("Unable to start server: %v", err)
+		ltndLog.Error(err)
 		return err
 	}
 	defer server.Stop()
@@ -485,15 +531,17 @@ func Main() error {
 	// stopped together with the autopilot service.
 	if cfg.Autopilot.Active {
 		if err := atplManager.StartAgent(); err != nil {
-			ltndLog.Errorf("unable to start autopilot agent: %v",
+			err := fmt.Errorf("Unable to start autopilot agent: %v",
 				err)
+			ltndLog.Error(err)
 			return err
 		}
 	}
 
 	if cfg.Watchtower.Active {
 		if err := tower.Start(); err != nil {
-			ltndLog.Errorf("Unable to start watchtower: %v", err)
+			err := fmt.Errorf("Unable to start watchtower: %v", err)
+			ltndLog.Error(err)
 			return err
 		}
 		defer tower.Stop()
