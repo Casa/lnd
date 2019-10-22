@@ -1,7 +1,7 @@
 language: go
 cache:
   directories:
-    - ~/bitcoin/bitcoin-0.18.0/bin
+    - ~/bitcoin/bitcoin-0.18.1/bin
     - $GOCACHE
     - $GOPATH/pkg/mod
     - $GOPATH/src/github.com/btcsuite
@@ -9,7 +9,7 @@ cache:
     - $GOPATH/src/gopkg.in/alecthomas
 
 go:
-  - "1.12.x"
+  - "1.13.x"
 
 env:
   global:

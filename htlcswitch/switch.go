@@ -163,11 +163,6 @@ type Config struct {
 	// fails in forwarding packages.
 	AckEventTicker ticker.Ticker
 
-	// NotifyActiveChannel and NotifyInactiveChannel allow the link to tell
-	// the ChannelNotifier when channels become active and inactive.
-	NotifyActiveChannel   func(wire.OutPoint)
-	NotifyInactiveChannel func(wire.OutPoint)
-
 	// RejectHTLC is a flag that instructs the htlcswitch to reject any
 	// HTLCs that are not from the source hop.
 	RejectHTLC bool
@@ -436,7 +431,7 @@ func (s *Switch) SendHTLC(firstHop lnwire.ShortChannelID, paymentID uint64,
 // forwarding policies for all links have been updated, or the switch shuts
 // down.
 func (s *Switch) UpdateForwardingPolicies(
-	chanPolicies map[wire.OutPoint]*channeldb.ChannelEdgePolicy) {
+	chanPolicies map[wire.OutPoint]ForwardingPolicy) {
 
 	log.Tracef("Updating link policies: %v", newLogClosure(func() string {
 		return spew.Sdump(chanPolicies)
@@ -445,7 +440,7 @@ func (s *Switch) UpdateForwardingPolicies(
 	s.indexMtx.RLock()
 
 	// Update each link in chanPolicies.
-	for targetLink := range chanPolicies {
+	for targetLink, policy := range chanPolicies {
 		cid := lnwire.NewChanIDFromOutPoint(&targetLink)
 
 		link, ok := s.linkIndex[cid]
@@ -455,26 +450,10 @@ func (s *Switch) UpdateForwardingPolicies(
 			continue
 		}
 
-		newPolicy := dbPolicyToFwdingPolicy(
-			chanPolicies[*link.ChannelPoint()],
-		)
-		link.UpdateForwardingPolicy(newPolicy)
+		link.UpdateForwardingPolicy(policy)
 	}
 
 	s.indexMtx.RUnlock()
-}
-
-// dbPolicyToFwdingPolicy is a helper function that converts a channeldb
-// ChannelEdgePolicy into a ForwardingPolicy struct for the purpose of updating
-// the forwarding policy of a link.
-func dbPolicyToFwdingPolicy(policy *channeldb.ChannelEdgePolicy) ForwardingPolicy {
-	return ForwardingPolicy{
-		BaseFee:       policy.FeeBaseMSat,
-		FeeRate:       policy.FeeProportionalMillionths,
-		TimeLockDelta: uint32(policy.TimeLockDelta),
-		MinHTLC:       policy.MinHTLC,
-		MaxHTLC:       policy.MaxHTLC,
-	}
 }
 
 // forward is used in order to find next channel link and apply htlc update.
@@ -975,7 +954,7 @@ func (s *Switch) parseFailedPayment(deobfuscator ErrorDecrypter,
 	// go on chain.
 	case isResolution && htlc.Reason == nil:
 		userErr := fmt.Sprintf("payment was resolved "+
-			"on-chain, then cancelled back (hash=%v, pid=%d)",
+			"on-chain, then canceled back (hash=%v, pid=%d)",
 			paymentHash, paymentID)
 
 		return &ForwardingError{
@@ -1882,7 +1861,7 @@ func (s *Switch) reforwardSettleFails(fwdPkgs []*channeldb.FwdPkg) {
 			// commitment state, so we'll forward this to the switch so the
 			// backwards undo can continue.
 			case lnwallet.Fail:
-				// Fetch the reason the HTLC was cancelled so we can
+				// Fetch the reason the HTLC was canceled so we can
 				// continue to propagate it.
 				failPacket := &htlcPacket{
 					outgoingChanID: fwdPkg.Source,
@@ -2012,11 +1991,6 @@ func (s *Switch) addLiveLink(link ChannelLink) {
 		s.interfaceIndex[peerPub] = make(map[lnwire.ChannelID]ChannelLink)
 	}
 	s.interfaceIndex[peerPub][link.ChanID()] = link
-
-	// Inform the channel notifier if the link has become active.
-	if link.EligibleToForward() {
-		s.cfg.NotifyActiveChannel(*link.ChannelPoint())
-	}
 }
 
 // GetLink is used to initiate the handling of the get link command. The
@@ -2091,9 +2065,6 @@ func (s *Switch) removeLink(chanID lnwire.ChannelID) ChannelLink {
 	if err != nil {
 		return nil
 	}
-
-	// Inform the Channel Notifier about the link becoming inactive.
-	s.cfg.NotifyInactiveChannel(*link.ChannelPoint())
 
 	// Remove the channel from live link indexes.
 	delete(s.pendingLinkIndex, link.ChanID())

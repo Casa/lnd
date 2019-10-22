@@ -1,9 +1,11 @@
 package routerrpc
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	math "math"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec"
@@ -16,7 +18,6 @@ import (
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/lightningnetwork/lnd/zpay32"
-	context "golang.org/x/net/context"
 )
 
 // RouterBackend contains the backend implementation of the router rpc sub
@@ -55,6 +56,10 @@ type RouterBackend struct {
 	// Tower is the ControlTower instance that is used to track pending
 	// payments.
 	Tower routing.ControlTower
+
+	// MaxTotalTimelock is the maximum total time lock a route is allowed to
+	// have.
+	MaxTotalTimelock uint32
 }
 
 // MissionControl defines the mission control dependencies of routerrpc.
@@ -165,6 +170,27 @@ func (r *RouterBackend) QueryRoutes(ctx context.Context,
 		ignoredPairs[pair] = struct{}{}
 	}
 
+	// Since QueryRoutes allows having a different source other than
+	// ourselves, we'll only apply our max time lock if we are the source.
+	maxTotalTimelock := r.MaxTotalTimelock
+	if sourcePubKey != r.SelfNode {
+		maxTotalTimelock = math.MaxUint32
+	}
+	cltvLimit, err := ValidateCLTVLimit(in.CltvLimit, maxTotalTimelock)
+	if err != nil {
+		return nil, err
+	}
+
+	// We need to subtract the final delta before passing it into path
+	// finding. The optimal path is independent of the final cltv delta and
+	// the path finding algorithm is unaware of this value.
+	finalCLTVDelta := uint16(zpay32.DefaultFinalCLTVDelta)
+	if in.FinalCltvDelta != 0 {
+		finalCLTVDelta = uint16(in.FinalCltvDelta)
+	}
+	cltvLimit -= uint32(finalCLTVDelta)
+
+	var destTLV map[uint64][]byte
 	restrictions := &routing.RestrictParams{
 		FeeLimit: feeLimit,
 		ProbabilitySource: func(fromNode, toNode route.Vertex,
@@ -190,13 +216,14 @@ func (r *RouterBackend) QueryRoutes(ctx context.Context,
 				fromNode, toNode, amt,
 			)
 		},
-		DestPayloadTLV: len(in.DestTlv) != 0,
+		DestPayloadTLV: len(destTLV) != 0,
+		CltvLimit:      cltvLimit,
 	}
 
 	// If we have any TLV records destined for the final hop, then we'll
 	// attempt to decode them now into a form that the router can more
 	// easily manipulate.
-	destTlvRecords, err := tlv.MapToRecords(in.DestTlv)
+	destTlvRecords, err := tlv.MapToRecords(destTLV)
 	if err != nil {
 		return nil, err
 	}
@@ -204,24 +231,12 @@ func (r *RouterBackend) QueryRoutes(ctx context.Context,
 	// Query the channel router for a possible path to the destination that
 	// can carry `in.Amt` satoshis _including_ the total fee required on
 	// the route.
-	var (
-		route   *route.Route
-		findErr error
+	route, err := r.FindRoute(
+		sourcePubKey, targetPubKey, amtMSat, restrictions,
+		destTlvRecords, finalCLTVDelta,
 	)
-
-	if in.FinalCltvDelta == 0 {
-		route, findErr = r.FindRoute(
-			sourcePubKey, targetPubKey, amtMSat, restrictions,
-			destTlvRecords,
-		)
-	} else {
-		route, findErr = r.FindRoute(
-			sourcePubKey, targetPubKey, amtMSat, restrictions,
-			destTlvRecords, uint16(in.FinalCltvDelta),
-		)
-	}
-	if findErr != nil {
-		return nil, findErr
+	if err != nil {
+		return nil, err
 	}
 
 	// For each valid route, we'll convert the result into the format
@@ -332,11 +347,6 @@ func (r *RouterBackend) MarshallRoute(route *route.Route) (*lnrpc.Route, error) 
 			chanCapacity = incomingAmt.ToSatoshis()
 		}
 
-		tlvMap, err := tlv.RecordsToMap(hop.TLVRecords)
-		if err != nil {
-			return nil, err
-		}
-
 		resp.Hops[i] = &lnrpc.Hop{
 			ChanId:           hop.ChannelID,
 			ChanCapacity:     int64(chanCapacity),
@@ -348,7 +358,6 @@ func (r *RouterBackend) MarshallRoute(route *route.Route) (*lnrpc.Route, error) 
 			PubKey: hex.EncodeToString(
 				hop.PubKeyBytes[:],
 			),
-			TlvRecords: tlvMap,
 			TlvPayload: !hop.LegacyPayload,
 		}
 		incomingAmt = hop.AmtToForward
@@ -380,10 +389,7 @@ func (r *RouterBackend) UnmarshallHopByChannelLookup(hop *lnrpc.Hop,
 		return nil, fmt.Errorf("channel edge does not match expected node")
 	}
 
-	tlvRecords, err := tlv.MapToRecords(hop.TlvRecords)
-	if err != nil {
-		return nil, err
-	}
+	var tlvRecords []tlv.Record
 
 	return &route.Hop{
 		OutgoingTimeLock: hop.Expiry,
@@ -408,12 +414,6 @@ func UnmarshallKnownPubkeyHop(hop *lnrpc.Hop) (*route.Hop, error) {
 	copy(pubKeyBytes[:], pubKey)
 
 	var tlvRecords []tlv.Record
-	if hop.TlvRecords != nil {
-		tlvRecords, err = tlv.MapToRecords(hop.TlvRecords)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	return &route.Hop{
 		OutgoingTimeLock: hop.Expiry,
@@ -485,11 +485,14 @@ func (r *RouterBackend) extractIntentFromSendRequest(
 		payIntent.OutgoingChannelID = &rpcPayReq.OutgoingChanId
 	}
 
-	// Take cltv limit from request if set.
-	if rpcPayReq.CltvLimit != 0 {
-		cltvLimit := uint32(rpcPayReq.CltvLimit)
-		payIntent.CltvLimit = &cltvLimit
+	// Take the CLTV limit from the request if set, otherwise use the max.
+	cltvLimit, err := ValidateCLTVLimit(
+		uint32(rpcPayReq.CltvLimit), r.MaxTotalTimelock,
+	)
+	if err != nil {
+		return nil, err
 	}
+	payIntent.CltvLimit = cltvLimit
 
 	// Take fee limit from request.
 	payIntent.FeeLimit = lnwire.NewMSatFromSatoshis(
@@ -501,11 +504,10 @@ func (r *RouterBackend) extractIntentFromSendRequest(
 		return nil, errors.New("timeout_seconds must be specified")
 	}
 
-	if len(rpcPayReq.DestTlv) != 0 {
+	var destTLV map[uint64][]byte
+	if len(destTLV) != 0 {
 		var err error
-		payIntent.FinalDestRecords, err = tlv.MapToRecords(
-			rpcPayReq.DestTlv,
-		)
+		payIntent.FinalDestRecords, err = tlv.MapToRecords(destTLV)
 		if err != nil {
 			return nil, err
 		}
@@ -689,4 +691,19 @@ func ValidatePayReqExpiry(payReq *zpay32.Invoice) error {
 	}
 
 	return nil
+}
+
+// ValidateCLTVLimit returns a valid CLTV limit given a value and a maximum. If
+// the value exceeds the maximum, then an error is returned. If the value is 0,
+// then the maximum is used.
+func ValidateCLTVLimit(val, max uint32) (uint32, error) {
+	switch {
+	case val == 0:
+		return max, nil
+	case val > max:
+		return 0, fmt.Errorf("total time lock of %v exceeds max "+
+			"allowed %v", val, max)
+	default:
+		return val, nil
+	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,16 +16,17 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/walletunlocker"
 	"github.com/urfave/cli"
 	"golang.org/x/crypto/ssh/terminal"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -2024,7 +2026,7 @@ func closedChannels(ctx *cli.Context) error {
 		LocalForce:      ctx.Bool("local_force"),
 		RemoteForce:     ctx.Bool("remote_force"),
 		Breach:          ctx.Bool("breach"),
-		FundingCanceled: ctx.Bool("funding_cancelled"),
+		FundingCanceled: ctx.Bool("funding_canceled"),
 		Abandoned:       ctx.Bool("abandoned"),
 	}
 
@@ -2381,22 +2383,23 @@ var sendToRouteCommand = cli.Command{
 	Usage:    "Send a payment over a predefined route.",
 	Description: `
 	Send a payment over Lightning using a specific route. One must specify
-	a list of routes to attempt and the payment hash. This command can even
-	be chained with the response to queryroutes. This command can be used
-	to implement channel rebalancing by crafting a self-route, or even
-	atomic swaps using a self-route that crosses multiple chains.
+	the route to attempt and the payment hash. This command can even
+	be chained with the response to queryroutes or buildroute. This command
+	can be used to implement channel rebalancing by crafting a self-route, 
+	or even atomic swaps using a self-route that crosses multiple chains.
 
-	There are three ways to specify routes:
+	There are three ways to specify a route:
 	   * using the --routes parameter to manually specify a JSON encoded
-	     set of routes in the format of the return value of queryroutes:
+	     route in the format of the return value of queryroutes or
+	     buildroute:
 	         (lncli sendtoroute --payment_hash=<pay_hash> --routes=<route>)
 
-	   * passing the routes as a positional argument:
+	   * passing the route as a positional argument:
 	         (lncli sendtoroute --payment_hash=pay_hash <route>)
 
-	   * or reading in the routes from stdin, which can allow chaining the
-	     response from queryroutes, or even read in a file with a set of
-	     pre-computed routes:
+	   * or reading in the route from stdin, which can allow chaining the
+	     response from queryroutes or buildroute, or even read in a file
+	     with a pre-computed route:
 	         (lncli queryroutes --args.. | lncli sendtoroute --payment_hash= -
 
 	     notice the '-' at the end, which signals that lncli should read
@@ -2474,25 +2477,37 @@ func sendToRoute(ctx *cli.Context) error {
 		jsonRoutes = string(b)
 	}
 
+	// Try to parse the provided json both in the legacy QueryRoutes format
+	// that contains a list of routes and the single route BuildRoute
+	// format.
+	var route *lnrpc.Route
 	routes := &lnrpc.QueryRoutesResponse{}
 	err = jsonpb.UnmarshalString(jsonRoutes, routes)
-	if err != nil {
-		return fmt.Errorf("unable to unmarshal json string "+
-			"from incoming array of routes: %v", err)
-	}
+	if err == nil {
+		if len(routes.Routes) == 0 {
+			return fmt.Errorf("no routes provided")
+		}
 
-	if len(routes.Routes) == 0 {
-		return fmt.Errorf("no routes provided")
-	}
+		if len(routes.Routes) != 1 {
+			return fmt.Errorf("expected a single route, but got %v",
+				len(routes.Routes))
+		}
 
-	if len(routes.Routes) != 1 {
-		return fmt.Errorf("expected a single route, but got %v",
-			len(routes.Routes))
+		route = routes.Routes[0]
+	} else {
+		routes := &routerrpc.BuildRouteResponse{}
+		err = jsonpb.UnmarshalString(jsonRoutes, routes)
+		if err != nil {
+			return fmt.Errorf("unable to unmarshal json string "+
+				"from incoming array of routes: %v", err)
+		}
+
+		route = routes.Route
 	}
 
 	req := &lnrpc.SendToRouteRequest{
 		PaymentHash: rHash,
-		Route:       routes.Routes[0],
+		Route:       route,
 	}
 
 	return sendToRouteRequest(ctx, req)
@@ -2986,6 +3001,7 @@ var queryRoutesCommand = cli.Command{
 			Name:  "use_mc",
 			Usage: "use mission control probabilities",
 		},
+		cltvLimitFlag,
 	},
 	Action: actionDecorator(queryRoutes),
 }
@@ -3036,6 +3052,7 @@ func queryRoutes(ctx *cli.Context) error {
 		FeeLimit:          feeLimit,
 		FinalCltvDelta:    int32(ctx.Int("final_cltv_delta")),
 		UseMissionControl: ctx.Bool("use_mc"),
+		CltvLimit:         uint32(ctx.Uint64(cltvLimitFlag.Name)),
 	}
 
 	route, err := client.QueryRoutes(ctxb, req)
@@ -3337,7 +3354,8 @@ var updateChannelPolicyCommand = cli.Command{
 	Category: "Channels",
 	Usage: "Update the channel policy for all channels, or a single " +
 		"channel.",
-	ArgsUsage: "base_fee_msat fee_rate time_lock_delta [channel_point]",
+	ArgsUsage: "base_fee_msat fee_rate time_lock_delta " +
+		"[--max_htlc_msat=N] [channel_point]",
 	Description: `
 	Updates the channel policy for all channels, or just a particular channel
 	identified by its channel point. The update will be committed, and
@@ -3361,6 +3379,12 @@ var updateChannelPolicyCommand = cli.Command{
 			Name: "time_lock_delta",
 			Usage: "the CLTV delta that will be applied to all " +
 				"forwarded HTLCs",
+		},
+		cli.Uint64Flag{
+			Name: "max_htlc_msat",
+			Usage: "if set, the max HTLC size that will be applied " +
+				"to all forwarded HTLCs. If unset, the max HTLC " +
+				"is left unchanged.",
 		},
 		cli.StringFlag{
 			Name: "chan_point",
@@ -3475,6 +3499,7 @@ func updateChannelPolicy(ctx *cli.Context) error {
 		BaseFeeMsat:   baseFee,
 		FeeRate:       feeRate,
 		TimeLockDelta: uint32(timeLockDelta),
+		MaxHtlcMsat:   ctx.Uint64("max_htlc_msat"),
 	}
 
 	if chanPoint != nil {
@@ -3560,6 +3585,9 @@ func forwardingHistory(ctx *cli.Context) error {
 			return fmt.Errorf("unable to decode start_time %v", err)
 		}
 		args = args.Tail()
+	default:
+		now := time.Now()
+		startTime = uint64(now.Add(-time.Hour * 24).Unix())
 	}
 
 	switch {

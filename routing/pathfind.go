@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/coreos/bbolt"
 
@@ -66,15 +67,6 @@ type edgePolicyWithSource struct {
 	edge       *channeldb.ChannelEdgePolicy
 }
 
-// computeFee computes the fee to forward an HTLC of `amt` milli-satoshis over
-// the passed active payment channel. This value is currently computed as
-// specified in BOLT07, but will likely change in the near future.
-func computeFee(amt lnwire.MilliSatoshi,
-	edge *channeldb.ChannelEdgePolicy) lnwire.MilliSatoshi {
-
-	return edge.FeeBaseMSat + (amt*edge.FeeProportionalMillionths)/1000000
-}
-
 // newRoute returns a fully valid route between the source and target that's
 // capable of supporting a payment of `amtToSend` after fees are fully
 // computed. If the route is too long, or the selected path cannot support the
@@ -129,7 +121,7 @@ func newRoute(amtToSend lnwire.MilliSatoshi, sourceVertex route.Vertex,
 			// and its policy for the outgoing channel. This policy
 			// is stored as part of the incoming channel of
 			// the next hop.
-			fee = computeFee(amtToForward, pathEdges[i+1])
+			fee = pathEdges[i+1].ComputeFee(amtToForward)
 		}
 
 		// If this is the last hop, then for verification purposes, the
@@ -268,7 +260,7 @@ type RestrictParams struct {
 	// CltvLimit is the maximum time lock of the route excluding the final
 	// ctlv. After path finding is complete, the caller needs to increase
 	// all cltv expiry heights with the required final cltv delta.
-	CltvLimit *uint32
+	CltvLimit uint32
 
 	// DestPayloadTLV should be set to true if we need to drop off a TLV
 	// payload at the final hop in order to properly complete this payment
@@ -304,6 +296,18 @@ type PathFindingConfig struct {
 func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 	source, target route.Vertex, amt lnwire.MilliSatoshi) (
 	[]*channeldb.ChannelEdgePolicy, error) {
+
+	// Pathfinding can be a significant portion of the total payment
+	// latency, especially on low-powered devices. Log several metrics to
+	// aid in the analysis performance problems in this area.
+	start := time.Now()
+	nodesVisited := 0
+	edgesExpanded := 0
+	defer func() {
+		timeElapsed := time.Since(start)
+		log.Debugf("Pathfinding perf metrics: nodes=%v, edges=%v, "+
+			"time=%v", nodesVisited, edgesExpanded, timeElapsed)
+	}()
 
 	var err error
 	tx := g.tx
@@ -411,6 +415,8 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 	processEdge := func(fromVertex route.Vertex, bandwidth lnwire.MilliSatoshi,
 		edge *channeldb.ChannelEdgePolicy, toNode route.Vertex) {
 
+		edgesExpanded++
+
 		// If this is not a local channel and it is disabled, we will
 		// skip it.
 		// TODO(halseth): also ignore disable flags for non-local
@@ -482,15 +488,15 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 		var fee lnwire.MilliSatoshi
 		var timeLockDelta uint16
 		if fromVertex != source {
-			fee = computeFee(amountToSend, edge)
+			fee = edge.ComputeFee(amountToSend)
 			timeLockDelta = edge.TimeLockDelta
 		}
 
 		incomingCltv := toNodeDist.incomingCltv +
 			uint32(timeLockDelta)
 
-		// Check that we have cltv limit and that we are within it.
-		if r.CltvLimit != nil && incomingCltv > *r.CltvLimit {
+		// Check that we are within our CLTV limit.
+		if incomingCltv > r.CltvLimit {
 			return
 		}
 
@@ -582,6 +588,8 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 	heap.Push(&nodeHeap, distance[target])
 
 	for nodeHeap.Len() != 0 {
+		nodesVisited++
+
 		// Fetch the node within the smallest distance from our source
 		// from the heap.
 		partialPath := heap.Pop(&nodeHeap).(nodeWithDist)

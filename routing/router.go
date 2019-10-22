@@ -21,6 +21,7 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chanvalidate"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/multimutex"
 	"github.com/lightningnetwork/lnd/routing/chainview"
@@ -219,6 +220,10 @@ type ChannelPolicy struct {
 	// TimeLockDelta is the required HTLC timelock delta to be used
 	// when forwarding payments.
 	TimeLockDelta uint32
+
+	// MaxHTLC is the maximum HTLC size including fees we are allowed to
+	// forward over this channel.
+	MaxHTLC lnwire.MilliSatoshi
 }
 
 // Config defines the configuration for the ChannelRouter. ALL elements within
@@ -1170,9 +1175,9 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		// to obtain the full funding outpoint that's encoded within
 		// the channel ID.
 		channelID := lnwire.NewShortChanIDFromInt(msg.ChannelID)
-		fundingPoint, _, err := r.fetchChanPoint(&channelID)
+		fundingTx, err := r.fetchFundingTx(&channelID)
 		if err != nil {
-			return errors.Errorf("unable to fetch chan point for "+
+			return errors.Errorf("unable to fetch funding tx for "+
 				"chan_id=%v: %v", msg.ChannelID, err)
 		}
 
@@ -1185,7 +1190,22 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		if err != nil {
 			return err
 		}
-		fundingPkScript, err := input.WitnessScriptHash(witnessScript)
+		pkScript, err := input.WitnessScriptHash(witnessScript)
+		if err != nil {
+			return err
+		}
+
+		// Next we'll validate that this channel is actually well
+		// formed. If this check fails, then this channel either
+		// doesn't exist, or isn't the one that was meant to be created
+		// according to the passed channel proofs.
+		fundingPoint, err := chanvalidate.Validate(&chanvalidate.Context{
+			Locator: &chanvalidate.ShortChanIDChanLocator{
+				ID: channelID,
+			},
+			MultiSigPkScript: pkScript,
+			FundingTx:        fundingTx,
+		})
 		if err != nil {
 			return err
 		}
@@ -1193,6 +1213,10 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		// Now that we have the funding outpoint of the channel, ensure
 		// that it hasn't yet been spent. If so, then this channel has
 		// been closed so we'll ignore it.
+		fundingPkScript, err := input.WitnessScriptHash(witnessScript)
+		if err != nil {
+			return err
+		}
 		chanUtxo, err := r.cfg.Chain.GetUtxo(
 			fundingPoint, fundingPkScript, channelID.BlockHeight,
 			r.quit,
@@ -1201,16 +1225,6 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 			return fmt.Errorf("unable to fetch utxo "+
 				"for chan_id=%v, chan_point=%v: %v",
 				msg.ChannelID, fundingPoint, err)
-		}
-
-		// By checking the equality of witness pkscripts we checks that
-		// funding witness script is multisignature lock which contains
-		// both local and remote public keys which was declared in
-		// channel edge and also that the announced channel value is
-		// right.
-		if !bytes.Equal(fundingPkScript, chanUtxo.PkScript) {
-			return errors.Errorf("pkScript mismatch: expected %x, "+
-				"got %x", fundingPkScript, chanUtxo.PkScript)
 		}
 
 		// TODO(roasbeef): this is a hack, needs to be removed
@@ -1335,25 +1349,24 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 	return nil
 }
 
-// fetchChanPoint retrieves the original outpoint which is encoded within the
-// channelID. This method also return the public key script for the target
-// transaction.
+// fetchFundingTx returns the funding transaction identified by the passed
+// short channel ID.
 //
 // TODO(roasbeef): replace with call to GetBlockTransaction? (would allow to
 // later use getblocktxn)
-func (r *ChannelRouter) fetchChanPoint(
-	chanID *lnwire.ShortChannelID) (*wire.OutPoint, *wire.TxOut, error) {
+func (r *ChannelRouter) fetchFundingTx(
+	chanID *lnwire.ShortChannelID) (*wire.MsgTx, error) {
 
 	// First fetch the block hash by the block number encoded, then use
 	// that hash to fetch the block itself.
 	blockNum := int64(chanID.BlockHeight)
 	blockHash, err := r.cfg.Chain.GetBlockHash(blockNum)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	fundingBlock, err := r.cfg.Chain.GetBlock(blockHash)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// As a sanity check, ensure that the advertised transaction index is
@@ -1361,21 +1374,12 @@ func (r *ChannelRouter) fetchChanPoint(
 	// block.
 	numTxns := uint32(len(fundingBlock.Transactions))
 	if chanID.TxIndex > numTxns-1 {
-		return nil, nil, fmt.Errorf("tx_index=#%v is out of range "+
-			"(max_index=%v), network_chan_id=%v\n", chanID.TxIndex,
-			numTxns-1, spew.Sdump(chanID))
+		return nil, fmt.Errorf("tx_index=#%v is out of range "+
+			"(max_index=%v), network_chan_id=%v", chanID.TxIndex,
+			numTxns-1, chanID)
 	}
 
-	// Finally once we have the block itself, we seek to the targeted
-	// transaction index to obtain the funding output and txout.
-	fundingTx := fundingBlock.Transactions[chanID.TxIndex]
-	outPoint := &wire.OutPoint{
-		Hash:  fundingTx.TxHash(),
-		Index: uint32(chanID.TxPosition),
-	}
-	txOut := fundingTx.TxOut[chanID.TxPosition]
-
-	return outPoint, txOut, nil
+	return fundingBlock.Transactions[chanID.TxIndex], nil
 }
 
 // routingMsg couples a routing related routing topology update to the
@@ -1556,7 +1560,7 @@ type LightningPayment struct {
 
 	// CltvLimit is the maximum time lock that is allowed for attempts to
 	// complete this payment.
-	CltvLimit *uint32
+	CltvLimit uint32
 
 	// PaymentHash is the r-hash value to use within the HTLC extended to
 	// the first hop.
@@ -2248,4 +2252,298 @@ func generateBandwidthHints(sourceNode *channeldb.LightningNode,
 	}
 
 	return bandwidthHints, nil
+}
+
+// runningAmounts keeps running amounts while the route is traversed.
+type runningAmounts struct {
+	// amt is the intended amount to send via the route.
+	amt lnwire.MilliSatoshi
+
+	// max is the running maximum that the route can carry.
+	max lnwire.MilliSatoshi
+}
+
+// prependChannel returns a new set of running amounts that would result from
+// prepending the given channel to the route. If canIncreaseAmt is set, the
+// amount may be increased if it is too small to satisfy the channel's minimum
+// htlc amount.
+func (r *runningAmounts) prependChannel(policy *channeldb.ChannelEdgePolicy,
+	capacity btcutil.Amount, localChan bool, canIncreaseAmt bool) (
+	runningAmounts, error) {
+
+	// Determine max htlc value.
+	maxHtlc := lnwire.NewMSatFromSatoshis(capacity)
+	if policy.MessageFlags.HasMaxHtlc() {
+		maxHtlc = policy.MaxHTLC
+	}
+
+	amt := r.amt
+
+	// If we have a specific amount for which we are building the route,
+	// validate it against the channel constraints and return the new
+	// running amount.
+	if !canIncreaseAmt {
+		if amt < policy.MinHTLC || amt > maxHtlc {
+			return runningAmounts{}, fmt.Errorf("channel htlc "+
+				"constraints [%v - %v] violated with amt %v",
+				policy.MinHTLC, maxHtlc, amt)
+		}
+
+		// Update running amount by adding the fee for non-local
+		// channels.
+		if !localChan {
+			amt += policy.ComputeFee(amt)
+		}
+
+		return runningAmounts{
+			amt: amt,
+		}, nil
+	}
+
+	// Adapt the minimum amount to what this channel allows.
+	if policy.MinHTLC > r.amt {
+		amt = policy.MinHTLC
+	}
+
+	// Update the maximum amount too to be able to detect incompatible
+	// channels.
+	max := r.max
+	if maxHtlc < r.max {
+		max = maxHtlc
+	}
+
+	// If we get in the situation that the minimum amount exceeds the
+	// maximum amount (enforced further down stream), we have incompatible
+	// channel policies.
+	//
+	// There is possibility with pubkey addressing that we should have
+	// selected a different channel downstream, but we don't backtrack to
+	// try to fix that. It would complicate path finding while we expect
+	// this situation to be rare. The spec recommends to keep all policies
+	// towards a peer identical. If that is the case, there isn't a better
+	// channel that we should have selected.
+	if amt > max {
+		return runningAmounts{},
+			fmt.Errorf("incompatible channel policies: %v "+
+				"exceeds %v", amt, max)
+	}
+
+	// Add fees to the running amounts. Skip the source node fees as
+	// those do not need to be paid.
+	if !localChan {
+		amt += policy.ComputeFee(amt)
+		max += policy.ComputeFee(max)
+	}
+
+	return runningAmounts{amt: amt, max: max}, nil
+}
+
+// ErrNoChannel is returned when a route cannot be built because there are no
+// channels that satisfy all requirements.
+type ErrNoChannel struct {
+	position int
+	fromNode route.Vertex
+}
+
+// Error returns a human readable string describing the error.
+func (e ErrNoChannel) Error() string {
+	return fmt.Sprintf("no matching outgoing channel available for "+
+		"node %v (%v)", e.position, e.fromNode)
+}
+
+// BuildRoute returns a fully specified route based on a list of pubkeys. If
+// amount is nil, the minimum routable amount is used. To force a specific
+// outgoing channel, use the outgoingChan parameter.
+func (r *ChannelRouter) BuildRoute(amt *lnwire.MilliSatoshi,
+	hops []route.Vertex, outgoingChan *uint64,
+	finalCltvDelta int32) (*route.Route, error) {
+
+	log.Tracef("BuildRoute called: hopsCount=%v, amt=%v",
+		len(hops), amt)
+
+	// If no amount is specified, we need to build a route for the minimum
+	// amount that this route can carry.
+	useMinAmt := amt == nil
+
+	// We'll attempt to obtain a set of bandwidth hints that helps us select
+	// the best outgoing channel to use in case no outgoing channel is set.
+	bandwidthHints, err := generateBandwidthHints(
+		r.selfNode, r.cfg.QueryBandwidth,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Allocate a list that will contain the selected channels for this
+	// route.
+	edges := make([]*channeldb.ChannelEdgePolicy, len(hops))
+
+	// Keep a running amount and the maximum for this route.
+	amts := runningAmounts{
+		max: lnwire.MilliSatoshi(^uint64(0)),
+	}
+	if useMinAmt {
+		// For minimum amount routes, aim to deliver at least 1 msat to
+		// the destination. There are nodes in the wild that have a
+		// min_htlc channel policy of zero, which could lead to a zero
+		// amount payment being made.
+		amts.amt = 1
+	} else {
+		// If an amount is specified, we need to build a route that
+		// delivers exactly this amount to the final destination.
+		amts.amt = *amt
+	}
+
+	// Traverse hops backwards to accumulate fees in the running amounts.
+	source := r.selfNode.PubKeyBytes
+	for i := len(hops) - 1; i >= 0; i-- {
+		toNode := hops[i]
+
+		var fromNode route.Vertex
+		if i == 0 {
+			fromNode = source
+		} else {
+			fromNode = hops[i-1]
+		}
+
+		localChan := i == 0
+
+		// Iterate over candidate channels to select the channel
+		// to use for the final route.
+		var (
+			bestEdge      *channeldb.ChannelEdgePolicy
+			bestAmts      *runningAmounts
+			bestBandwidth lnwire.MilliSatoshi
+		)
+
+		cb := func(tx *bbolt.Tx,
+			edgeInfo *channeldb.ChannelEdgeInfo,
+			_, inEdge *channeldb.ChannelEdgePolicy) error {
+
+			chanID := edgeInfo.ChannelID
+
+			// Apply outgoing channel restriction is active.
+			if localChan && outgoingChan != nil &&
+				chanID != *outgoingChan {
+
+				return nil
+			}
+
+			// No unknown policy channels.
+			if inEdge == nil {
+				return nil
+			}
+
+			// Before we can process the edge, we'll need to
+			// fetch the node on the _other_ end of this
+			// channel as we may later need to iterate over
+			// the incoming edges of this node if we explore
+			// it further.
+			chanFromNode, err := edgeInfo.FetchOtherNode(
+				tx, toNode[:],
+			)
+			if err != nil {
+				return err
+			}
+
+			// Continue searching if this channel doesn't
+			// connect with the previous hop.
+			if chanFromNode.PubKeyBytes != fromNode {
+				return nil
+			}
+
+			// Validate whether this channel's policy is satisfied
+			// and obtain the new running amounts if this channel
+			// was to be selected.
+			newAmts, err := amts.prependChannel(
+				inEdge, edgeInfo.Capacity, localChan,
+				useMinAmt,
+			)
+			if err != nil {
+				log.Tracef("Skipping chan %v: %v",
+					inEdge.ChannelID, err)
+
+				return nil
+			}
+
+			// If we already have a best edge, check whether this
+			// edge is better.
+			bandwidth := bandwidthHints[chanID]
+			if bestEdge != nil {
+				if localChan {
+					// For local channels, better is defined
+					// as having more bandwidth. We try to
+					// maximize the chance that the returned
+					// route succeeds.
+					if bandwidth < bestBandwidth {
+						return nil
+					}
+				} else {
+					// For other channels, better is defined
+					// as lower fees for the amount to send.
+					// Normally all channels between two
+					// nodes should have the same policy,
+					// but in case not we minimize our cost
+					// here. Regular path finding would do
+					// the same.
+					if newAmts.amt > bestAmts.amt {
+						return nil
+					}
+				}
+			}
+
+			// If we get here, the current edge is better. Replace
+			// the best.
+			bestEdge = inEdge
+			bestAmts = &newAmts
+			bestBandwidth = bandwidth
+
+			return nil
+		}
+
+		err := r.cfg.Graph.ForEachNodeChannel(nil, toNode[:], cb)
+		if err != nil {
+			return nil, err
+		}
+
+		// There is no matching channel. Stop building the route here.
+		if bestEdge == nil {
+			return nil, ErrNoChannel{
+				fromNode: fromNode,
+				position: i,
+			}
+		}
+
+		log.Tracef("Select channel %v at position %v", bestEdge.ChannelID, i)
+
+		edges[i] = bestEdge
+		amts = *bestAmts
+	}
+
+	_, height, err := r.cfg.Chain.GetBestBlock()
+	if err != nil {
+		return nil, err
+	}
+
+	var receiverAmt lnwire.MilliSatoshi
+	if useMinAmt {
+		// We've calculated the minimum amount for the htlc that the
+		// source node hands out. The newRoute call below expects the
+		// amount that must reach the receiver after subtraction of fees
+		// along the way. Iterate over all edges to calculate the
+		// receiver amount.
+		receiverAmt = amts.amt
+		for _, edge := range edges[1:] {
+			receiverAmt -= edge.ComputeFeeFromIncoming(receiverAmt)
+		}
+	} else {
+		// Deliver the specified amount to the receiver.
+		receiverAmt = *amt
+	}
+
+	// Build and return the final route.
+	return newRoute(
+		receiverAmt, source, edges, uint32(height),
+		uint16(finalCltvDelta), nil,
+	)
 }

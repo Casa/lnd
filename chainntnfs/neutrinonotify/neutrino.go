@@ -15,8 +15,8 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcutil/gcs/builder"
-	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/lightninglabs/neutrino"
+	"github.com/lightninglabs/neutrino/headerfs"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/queue"
 )
@@ -116,12 +116,20 @@ func (n *NeutrinoNotifier) Start() error {
 		return nil
 	}
 
+	// Start our concurrent queues before starting the rescan, to ensure
+	// onFilteredBlockConnected and onRelavantTx callbacks won't be
+	// blocked.
+	n.chainUpdates.Start()
+	n.txUpdates.Start()
+
 	// First, we'll obtain the latest block height of the p2p node. We'll
 	// start the auto-rescan from this point. Once a caller actually wishes
 	// to register a chain view, the rescan state will be rewound
 	// accordingly.
 	startingPoint, err := n.p2pNode.BestBlock()
 	if err != nil {
+		n.txUpdates.Stop()
+		n.chainUpdates.Stop()
 		return err
 	}
 	n.bestBlock.Hash = &startingPoint.Hash
@@ -159,9 +167,6 @@ func (n *NeutrinoNotifier) Start() error {
 		rescanOptions...,
 	)
 	n.rescanErr = n.chainView.Start()
-
-	n.chainUpdates.Start()
-	n.txUpdates.Start()
 
 	n.wg.Add(1)
 	go n.notificationDispatcher()
@@ -297,7 +302,7 @@ out:
 				// safely close the channel used to send epoch
 				// notifications, in order to notify any
 				// listeners that the intent has been
-				// cancelled.
+				// canceled.
 				close(n.blockEpochClients[msg.epochID].epochChan)
 				delete(n.blockEpochClients, msg.epochID)
 			}
@@ -522,17 +527,11 @@ func (n *NeutrinoNotifier) historicalConfDetails(confRequest chainntnfs.ConfRequ
 		// for this height.
 		regFilter, err := n.p2pNode.GetCFilter(
 			*blockHash, wire.GCSFilterRegular,
+			neutrino.NumRetries(5),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("unable to retrieve regular filter for "+
 				"height=%v: %v", scanHeight, err)
-		}
-
-		// If the block has no transactions other than the Coinbase
-		// transaction, then the filter may be nil, so we'll continue
-		// forward int that case.
-		if regFilter == nil {
-			continue
 		}
 
 		// In the case that the filter exists, we'll attempt to see if
@@ -753,10 +752,10 @@ func (n *NeutrinoNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 
 		spendReport, err := n.p2pNode.GetUtxo(
 			neutrino.WatchInputs(inputToWatch),
-			neutrino.StartBlock(&waddrmgr.BlockStamp{
+			neutrino.StartBlock(&headerfs.BlockStamp{
 				Height: int32(ntfn.HistoricalDispatch.StartHeight),
 			}),
-			neutrino.EndBlock(&waddrmgr.BlockStamp{
+			neutrino.EndBlock(&headerfs.BlockStamp{
 				Height: int32(ntfn.HistoricalDispatch.EndHeight),
 			}),
 			neutrino.QuitChan(n.quit),

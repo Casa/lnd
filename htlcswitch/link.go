@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btclog"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
+	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
@@ -39,11 +41,12 @@ const (
 	// willing to lock its own funds too, could force the funds of this node
 	// to be locked up for an indefinite (max int32) number of blocks.
 	//
-	// The value 1008 corresponds to on average one week worth of blocks and
-	// is based on the maximum number of hops (20), the default cltv delta
-	// (40) and some extra margin to account for the other lightning
-	// implementations.
-	DefaultMaxOutgoingCltvExpiry = 1008
+	// The value 2016 corresponds to on average two weeks worth of blocks
+	// and is based on the maximum number of hops (20), the default CLTV
+	// delta (40), and some extra margin to account for the other lightning
+	// implementations and past lnd versions which used to have a default
+	// CLTV delta of 144.
+	DefaultMaxOutgoingCltvExpiry = 2016
 
 	// DefaultMinLinkFeeUpdateTimeout represents the minimum interval in
 	// which a link should propose to update its commitment fee rate.
@@ -262,6 +265,14 @@ type ChannelLinkConfig struct {
 	// commitment fee to be of its balance. This only applies to the
 	// initiator of the channel.
 	MaxFeeAllocation float64
+
+	// NotifyActiveChannel allows the link to tell the ChannelNotifier when
+	// channels becomes active.
+	NotifyActiveChannel func(wire.OutPoint)
+
+	// NotifyInactiveChannel allows the switch to tell the ChannelNotifier
+	// when channels become inactive.
+	NotifyInactiveChannel func(wire.OutPoint)
 }
 
 // channelLink is the service which drives a channel's commitment update
@@ -271,8 +282,9 @@ type ChannelLinkConfig struct {
 // message ordering and updates.
 type channelLink struct {
 	// The following fields are only meant to be used *atomically*
-	started  int32
-	shutdown int32
+	started       int32
+	reestablished int32
+	shutdown      int32
 
 	// failed should be set to true in case a link error happens, making
 	// sure we don't process any more updates.
@@ -364,9 +376,12 @@ type channelLink struct {
 	// registry.
 	hodlQueue *queue.ConcurrentQueue
 
-	// hodlMap stores a list of htlc data structs per hash. It allows
+	// hodlMap stores related htlc data for a circuit key. It allows
 	// resolving those htlcs when we receive a message on hodlQueue.
-	hodlMap map[lntypes.Hash][]hodlHtlc
+	hodlMap map[channeldb.CircuitKey]hodlHtlc
+
+	// log is a link-specific logging instance.
+	log btclog.Logger
 
 	wg   sync.WaitGroup
 	quit chan struct{}
@@ -383,6 +398,8 @@ type hodlHtlc struct {
 func NewChannelLink(cfg ChannelLinkConfig,
 	channel *lnwallet.LightningChannel) ChannelLink {
 
+	logPrefix := fmt.Sprintf("ChannelLink(%v):", channel.ShortChanID())
+
 	return &channelLink{
 		cfg:         cfg,
 		channel:     channel,
@@ -391,8 +408,9 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		logCommitTimer: time.NewTimer(300 * time.Millisecond),
 		overflowQueue:  newPacketQueue(input.MaxHTLCNumber / 2),
 		htlcUpdates:    make(chan *contractcourt.ContractUpdate),
-		hodlMap:        make(map[lntypes.Hash][]hodlHtlc),
+		hodlMap:        make(map[channeldb.CircuitKey]hodlHtlc),
 		hodlQueue:      queue.NewConcurrentQueue(10),
+		log:            build.NewPrefixLog(logPrefix, log),
 		quit:           make(chan struct{}),
 	}
 }
@@ -408,11 +426,11 @@ var _ ChannelLink = (*channelLink)(nil)
 func (l *channelLink) Start() error {
 	if !atomic.CompareAndSwapInt32(&l.started, 0, 1) {
 		err := errors.Errorf("channel link(%v): already started", l)
-		log.Warn(err)
+		l.log.Warn("already started")
 		return err
 	}
 
-	log.Infof("ChannelLink(%v) is starting", l)
+	l.log.Info("starting")
 
 	// If the config supplied watchtower client, ensure the channel is
 	// registered before trying to use it during operation.
@@ -465,8 +483,7 @@ func (l *channelLink) Start() error {
 
 			err := l.cfg.UpdateContractSignals(signals)
 			if err != nil {
-				log.Errorf("Unable to update signals for "+
-					"ChannelLink(%v)", l)
+				l.log.Errorf("unable to update signals")
 			}
 		}()
 	}
@@ -485,11 +502,11 @@ func (l *channelLink) Start() error {
 // NOTE: Part of the ChannelLink interface.
 func (l *channelLink) Stop() {
 	if !atomic.CompareAndSwapInt32(&l.shutdown, 0, 1) {
-		log.Warnf("channel link(%v): already stopped", l)
+		l.log.Warn("already stopped")
 		return
 	}
 
-	log.Infof("ChannelLink(%v) is stopping", l)
+	l.log.Info("stopping")
 
 	// As the link is stopping, we are no longer interested in hodl events
 	// coming from the invoice registry.
@@ -514,7 +531,7 @@ func (l *channelLink) Stop() {
 	// we had learned them at some point.
 	err := l.cfg.PreimageCache.AddPreimages(l.uncommittedPreimages...)
 	if err != nil {
-		log.Errorf("Unable to add preimages=%v to cache: %v",
+		l.log.Errorf("unable to add preimages=%v to cache: %v",
 			l.uncommittedPreimages, err)
 	}
 }
@@ -532,7 +549,21 @@ func (l *channelLink) WaitForShutdown() {
 // the all-zero source ID, meaning that the channel has had its ID finalized.
 func (l *channelLink) EligibleToForward() bool {
 	return l.channel.RemoteNextRevocation() != nil &&
-		l.ShortChanID() != hop.Source
+		l.ShortChanID() != hop.Source &&
+		l.isReestablished()
+}
+
+// isReestablished returns true if the link has successfully completed the
+// channel reestablishment dance.
+func (l *channelLink) isReestablished() bool {
+	return atomic.LoadInt32(&l.reestablished) == 1
+}
+
+// markReestablished signals that the remote peer has successfully exchanged
+// channel reestablish messages and that the channel is ready to process
+// subsequent messages.
+func (l *channelLink) markReestablished() {
+	atomic.StoreInt32(&l.reestablished, 1)
 }
 
 // sampleNetworkFee samples the current fee rate on the network to get into the
@@ -547,8 +578,8 @@ func (l *channelLink) sampleNetworkFee() (lnwallet.SatPerKWeight, error) {
 		return 0, err
 	}
 
-	log.Debugf("ChannelLink(%v): sampled fee rate for 3 block conf: %v "+
-		"sat/kw", l, int64(feePerKw))
+	l.log.Debugf("sampled fee rate for 3 block conf: %v sat/kw",
+		int64(feePerKw))
 
 	return feePerKw, nil
 }
@@ -579,35 +610,16 @@ func shouldAdjustCommitFee(netFee, chanFee lnwallet.SatPerKWeight) bool {
 // flow. We'll compare out commitment chains with the remote party, and re-send
 // either a danging commit signature, a revocation, or both.
 func (l *channelLink) syncChanStates() error {
-	log.Infof("Attempting to re-resynchronize ChannelPoint(%v)",
-		l.channel.ChannelPoint())
+	l.log.Info("attempting to re-resynchronize")
 
 	// First, we'll generate our ChanSync message to send to the other
 	// side. Based on this message, the remote party will decide if they
 	// need to retransmit any data or not.
 	chanState := l.channel.State()
-	localChanSyncMsg, err := lnwallet.ChanSyncMsg(
-		chanState,
-		chanState.HasChanStatus(channeldb.ChanStatusRestored),
-	)
+	localChanSyncMsg, err := chanState.ChanSyncMsg()
 	if err != nil {
 		return fmt.Errorf("unable to generate chan sync message for "+
 			"ChannelPoint(%v)", l.channel.ChannelPoint())
-	}
-
-	// If we have a restored channel, we'll delay sending our channel
-	// reestablish message briefly to ensure we first have a stable
-	// connection. Sending the message will cause the remote peer to force
-	// close the channel, which currently may not be resumed reliably if the
-	// connection is being torn down simultaneously. This delay can be
-	// removed after the force close is reliable, but in the meantime it
-	// improves the reliability of successfully closing out the channel.
-	if chanState.HasChanStatus(channeldb.ChanStatusRestored) {
-		select {
-		case <-time.After(5 * time.Second):
-		case <-l.quit:
-			return ErrLinkShuttingDown
-		}
 	}
 
 	if err := l.cfg.Peer.SendMessage(true, localChanSyncMsg); err != nil {
@@ -617,10 +629,8 @@ func (l *channelLink) syncChanStates() error {
 
 	var msgsToReSend []lnwire.Message
 
-	// Next, we'll wait to receive the ChanSync message with a timeout
-	// period. The first message sent MUST be the ChanSync message,
-	// otherwise, we'll terminate the connection.
-	chanSyncDeadline := time.After(time.Second * 30)
+	// Next, we'll wait indefinitely to receive the ChanSync message. The
+	// first message sent MUST be the ChanSync message.
 	select {
 	case msg := <-l.upstream:
 		remoteChanSyncMsg, ok := msg.(*lnwire.ChannelReestablish)
@@ -639,9 +649,7 @@ func (l *channelLink) syncChanStates() error {
 			localChanSyncMsg.NextLocalCommitHeight == 1 &&
 			!l.channel.IsPending() {
 
-			log.Infof("ChannelPoint(%v): resending "+
-				"FundingLocked message to peer",
-				l.channel.ChannelPoint())
+			l.log.Infof("resending FundingLocked message to peer")
 
 			nextRevocation, err := l.channel.NextRevocationKey()
 			if err != nil {
@@ -660,8 +668,7 @@ func (l *channelLink) syncChanStates() error {
 		}
 
 		// In any case, we'll then process their ChanSync message.
-		log.Infof("Received re-establishment message from remote side "+
-			"for channel(%v)", l.channel.ChannelPoint())
+		l.log.Info("received re-establishment message from remote side")
 
 		var (
 			openedCircuits []CircuitKey
@@ -690,9 +697,8 @@ func (l *channelLink) syncChanStates() error {
 		}
 
 		if len(msgsToReSend) > 0 {
-			log.Infof("Sending %v updates to synchronize the "+
-				"state for ChannelPoint(%v)", len(msgsToReSend),
-				l.channel.ChannelPoint())
+			l.log.Infof("sending %v updates to synchronize the "+
+				"state", len(msgsToReSend))
 		}
 
 		// If we have any messages to retransmit, we'll do so
@@ -704,10 +710,6 @@ func (l *channelLink) syncChanStates() error {
 
 	case <-l.quit:
 		return ErrLinkShuttingDown
-
-	case <-chanSyncDeadline:
-		return fmt.Errorf("didn't receive ChannelReestablish before " +
-			"deadline")
 	}
 
 	return nil
@@ -724,7 +726,7 @@ func (l *channelLink) resolveFwdPkgs() error {
 		return err
 	}
 
-	l.debugf("loaded %d fwd pks", len(fwdPkgs))
+	l.log.Debugf("loaded %d fwd pks", len(fwdPkgs))
 
 	var needUpdate bool
 	for _, fwdPkg := range fwdPkgs {
@@ -751,13 +753,13 @@ func (l *channelLink) resolveFwdPkgs() error {
 func (l *channelLink) resolveFwdPkg(fwdPkg *channeldb.FwdPkg) (bool, error) {
 	// Remove any completed packages to clear up space.
 	if fwdPkg.State == channeldb.FwdStateCompleted {
-		l.debugf("removing completed fwd pkg for height=%d",
+		l.log.Debugf("removing completed fwd pkg for height=%d",
 			fwdPkg.Height)
 
 		err := l.channel.RemoveFwdPkg(fwdPkg.Height)
 		if err != nil {
-			l.errorf("unable to remove fwd pkg for height=%d: %v",
-				fwdPkg.Height, err)
+			l.log.Errorf("unable to remove fwd pkg for height=%d: "+
+				"%v", fwdPkg.Height, err)
 			return false, err
 		}
 	}
@@ -775,7 +777,7 @@ func (l *channelLink) resolveFwdPkg(fwdPkg *channeldb.FwdPkg) (bool, error) {
 			fwdPkg.Source, fwdPkg.Height, fwdPkg.SettleFails,
 		)
 		if err != nil {
-			l.errorf("Unable to process remote log updates: %v",
+			l.log.Errorf("unable to process remote log updates: %v",
 				err)
 			return false, err
 		}
@@ -792,7 +794,7 @@ func (l *channelLink) resolveFwdPkg(fwdPkg *channeldb.FwdPkg) (bool, error) {
 			fwdPkg.Source, fwdPkg.Height, fwdPkg.Adds,
 		)
 		if err != nil {
-			l.errorf("Unable to process remote log updates: %v",
+			l.log.Errorf("unable to process remote log updates: %v",
 				err)
 			return false, err
 		}
@@ -827,7 +829,8 @@ func (l *channelLink) fwdPkgGarbager() {
 		case <-l.cfg.FwdPkgGCTicker.Ticks():
 			fwdPkgs, err := l.channel.LoadFwdPkgs()
 			if err != nil {
-				l.warnf("unable to load fwdpkgs for gc: %v", err)
+				l.log.Warnf("unable to load fwdpkgs for gc: %v",
+					err)
 				continue
 			}
 
@@ -839,7 +842,7 @@ func (l *channelLink) fwdPkgGarbager() {
 
 				err = l.channel.RemoveFwdPkg(fwdPkg.Height)
 				if err != nil {
-					l.warnf("unable to remove fwd pkg "+
+					l.log.Warnf("unable to remove fwd pkg "+
 						"for height=%d: %v",
 						fwdPkg.Height, err)
 				}
@@ -864,11 +867,10 @@ func (l *channelLink) htlcManager() {
 	defer func() {
 		l.cfg.BatchTicker.Stop()
 		l.wg.Done()
-		log.Infof("ChannelLink(%v) has exited", l)
+		l.log.Infof("exited")
 	}()
 
-	log.Infof("HTLC manager for ChannelPoint(%v) started, "+
-		"bandwidth=%v", l.channel.ChannelPoint(), l.Bandwidth())
+	l.log.Infof("HTLC manager started, bandwidth=%v", l.Bandwidth())
 
 	// TODO(roasbeef): need to call wipe chan whenever D/C?
 
@@ -879,9 +881,14 @@ func (l *channelLink) htlcManager() {
 	if l.cfg.SyncStates {
 		err := l.syncChanStates()
 		if err != nil {
+			l.log.Warnf("error when syncing channel states: %v", err)
+
+			errDataLoss, localDataLoss :=
+				err.(*lnwallet.ErrCommitSyncLocalDataLoss)
+
 			switch {
 			case err == ErrLinkShuttingDown:
-				log.Debugf("unable to sync channel states, " +
+				l.log.Debugf("unable to sync channel states, " +
 					"link is shutting down")
 				return
 
@@ -901,6 +908,12 @@ func (l *channelLink) htlcManager() {
 			// what they sent us before.
 			// TODO(halseth): ban peer?
 			case err == lnwallet.ErrInvalidLocalUnrevokedCommitPoint:
+				// We'll fail the link and tell the peer to
+				// force close the channel. Note that the
+				// database state is not updated here, but will
+				// be updated when the close transaction is
+				// ready to avoid that we go down before
+				// storing the transaction in the db.
 				l.fail(
 					LinkFailureError{
 						code:       ErrSyncError,
@@ -914,13 +927,18 @@ func (l *channelLink) htlcManager() {
 			// We have lost state and cannot safely force close the
 			// channel. Fail the channel and wait for the remote to
 			// hopefully force close it. The remote has sent us its
-			// latest unrevoked commitment point, that we stored in
-			// the database, that we can use to retrieve the funds
-			// when the remote closes the channel.
-			// TODO(halseth): mark this, such that we prevent
-			// channel from being force closed by the user or
-			// contractcourt etc.
-			case err == lnwallet.ErrCommitSyncLocalDataLoss:
+			// latest unrevoked commitment point, and we'll store
+			// it in the database, such that we can attempt to
+			// recover the funds if the remote force closes the
+			// channel.
+			case localDataLoss:
+				err := l.channel.MarkDataLoss(
+					errDataLoss.CommitPoint,
+				)
+				if err != nil {
+					l.log.Errorf("unable to mark channel "+
+						"data loss: %v", err)
+				}
 
 			// We determined the commit chains were not possible to
 			// sync. We cautiously fail the channel, but don't
@@ -928,6 +946,10 @@ func (l *channelLink) htlcManager() {
 			// TODO(halseth): can we safely force close in any
 			// cases where this error is returned?
 			case err == lnwallet.ErrCannotSyncCommitChains:
+				if err := l.channel.MarkBorked(); err != nil {
+					l.log.Errorf("unable to mark channel "+
+						"borked: %v", err)
+				}
 
 			// Other, unspecified error.
 			default:
@@ -935,7 +957,7 @@ func (l *channelLink) htlcManager() {
 
 			l.fail(
 				LinkFailureError{
-					code:       ErrSyncError,
+					code:       ErrRecoveryError,
 					ForceClose: false,
 				},
 				"unable to synchronize channel "+
@@ -944,6 +966,17 @@ func (l *channelLink) htlcManager() {
 			return
 		}
 	}
+
+	// We've successfully reestablished the channel, mark it as such to
+	// allow the switch to forward HTLCs in the outbound direction.
+	l.markReestablished()
+
+	// Now that we've received both funding locked and channel reestablish,
+	// we can go ahead and send the active channel notification. We'll also
+	// defer the inactive notification for when the link exits to ensure
+	// that every active notification is matched by an inactive one.
+	l.cfg.NotifyActiveChannel(*l.ChannelPoint())
+	defer l.cfg.NotifyInactiveChannel(*l.ChannelPoint())
 
 	// With the channel states synced, we now reset the mailbox to ensure
 	// we start processing all unacked packets in order. This is done here
@@ -977,7 +1010,7 @@ out:
 		// We must always check if we failed at some point processing
 		// the last update before processing the next.
 		if l.failed {
-			l.errorf("link failed, exiting htlcManager")
+			l.log.Errorf("link failed, exiting htlcManager")
 			break out
 		}
 
@@ -1005,7 +1038,8 @@ out:
 			// blocks.
 			netFee, err := l.sampleNetworkFee()
 			if err != nil {
-				log.Errorf("unable to sample network fee: %v", err)
+				l.log.Errorf("unable to sample network fee: %v",
+					err)
 				continue
 			}
 
@@ -1024,7 +1058,8 @@ out:
 			// If we do, then we'll send a new UpdateFee message to
 			// the remote party, to be locked in with a new update.
 			if err := l.updateChannelFee(newCommitFee); err != nil {
-				log.Errorf("unable to update fee rate: %v", err)
+				l.log.Errorf("unable to update fee rate: %v",
+					err)
 				continue
 			}
 
@@ -1035,15 +1070,15 @@ out:
 		//
 		// TODO(roasbeef): add force closure? also breach?
 		case <-l.cfg.ChainEvents.RemoteUnilateralClosure:
-			log.Warnf("Remote peer has closed ChannelPoint(%v) on-chain",
-				l.channel.ChannelPoint())
+			l.log.Warnf("remote peer has closed on-chain")
 
 			// TODO(roasbeef): remove all together
 			go func() {
 				chanPoint := l.channel.ChannelPoint()
 				err := l.cfg.Peer.WipeChannel(chanPoint)
 				if err != nil {
-					log.Errorf("unable to wipe channel %v", err)
+					l.log.Errorf("unable to wipe channel "+
+						"%v", err)
 				}
 			}()
 
@@ -1090,7 +1125,7 @@ out:
 		// to continue propagating within the network.
 		case packet := <-l.overflowQueue.outgoingPkts:
 			msg := packet.htlc.(*lnwire.UpdateAddHTLC)
-			log.Tracef("Reprocessing downstream add update "+
+			l.log.Tracef("reprocessing downstream add update "+
 				"with payment hash(%x)", msg.PaymentHash[:])
 
 			l.handleDownStreamPkt(packet, true)
@@ -1105,7 +1140,7 @@ out:
 			// failed, then we'll free up a new slot.
 			htlc, ok := pkt.htlc.(*lnwire.UpdateAddHTLC)
 			if ok && l.overflowQueue.Length() != 0 {
-				log.Infof("Downstream htlc add update with "+
+				l.log.Infof("downstream htlc add update with "+
 					"payment hash(%x) have been added to "+
 					"reprocessing queue, batch_size=%v",
 					htlc.PaymentHash[:],
@@ -1151,9 +1186,20 @@ func (l *channelLink) processHodlQueue(firstHodlEvent invoices.HodlEvent) error 
 	hodlEvent := firstHodlEvent
 loop:
 	for {
-		if err := l.processHodlMapEvent(hodlEvent); err != nil {
+		// Lookup all hodl htlcs that can be failed or settled with this event.
+		// The hodl htlc must be present in the map.
+		circuitKey := hodlEvent.CircuitKey
+		hodlHtlc, ok := l.hodlMap[circuitKey]
+		if !ok {
+			return fmt.Errorf("hodl htlc not found: %v", circuitKey)
+		}
+
+		if err := l.processHodlEvent(hodlEvent, hodlHtlc); err != nil {
 			return err
 		}
+
+		// Clean up hodl map.
+		delete(l.hodlMap, circuitKey)
 
 		select {
 		case item := <-l.hodlQueue.ChanOut():
@@ -1171,73 +1217,37 @@ loop:
 	return nil
 }
 
-// processHodlMapEvent resolves stored hodl htlcs based using the information in
-// hodlEvent.
-func (l *channelLink) processHodlMapEvent(hodlEvent invoices.HodlEvent) error {
-	// Lookup all hodl htlcs that can be failed or settled with this event.
-	// The hodl htlc must be present in the map.
-	hash := hodlEvent.Hash
-	hodlHtlcs, ok := l.hodlMap[hash]
-	if !ok {
-		return fmt.Errorf("hodl htlc not found: %v", hash)
-	}
-
-	if err := l.processHodlEvent(hodlEvent, hodlHtlcs...); err != nil {
-		return err
-	}
-
-	// Clean up hodl map.
-	delete(l.hodlMap, hash)
-
-	return nil
-}
-
 // processHodlEvent applies a received hodl event to the provided htlc. When
 // this function returns without an error, the commit tx should be updated.
 func (l *channelLink) processHodlEvent(hodlEvent invoices.HodlEvent,
-	htlcs ...hodlHtlc) error {
+	htlc hodlHtlc) error {
 
-	hash := hodlEvent.Hash
+	l.batchCounter++
+
+	circuitKey := hodlEvent.CircuitKey
 
 	// Determine required action for the resolution.
-	var hodlAction func(htlc hodlHtlc) error
 	if hodlEvent.Preimage != nil {
-		l.debugf("Received hodl settle event for %v", hash)
+		l.log.Debugf("received hodl settle event for %v", circuitKey)
 
-		hodlAction = func(htlc hodlHtlc) error {
-			return l.settleHTLC(
-				*hodlEvent.Preimage, htlc.pd.HtlcIndex,
-				htlc.pd.SourceRef,
-			)
-		}
-	} else {
-		l.debugf("Received hodl cancel event for %v", hash)
-
-		hodlAction = func(htlc hodlHtlc) error {
-			// In case of a cancel, always return
-			// incorrect_or_unknown_payment_details in order to
-			// avoid leaking info.
-			failure := lnwire.NewFailIncorrectDetails(
-				htlc.pd.Amount,
-			)
-
-			l.sendHTLCError(
-				htlc.pd.HtlcIndex, failure, htlc.obfuscator,
-				htlc.pd.SourceRef,
-			)
-			return nil
-		}
+		return l.settleHTLC(
+			*hodlEvent.Preimage, htlc.pd.HtlcIndex,
+			htlc.pd.SourceRef,
+		)
 	}
 
-	// Apply action for all htlcs matching this hash.
-	for _, htlc := range htlcs {
-		if err := hodlAction(htlc); err != nil {
-			return err
-		}
+	l.log.Debugf("received hodl cancel event for %v", circuitKey)
 
-		l.batchCounter++
-	}
+	// In case of a cancel, always return
+	// incorrect_or_unknown_payment_details in order to avoid leaking info.
+	failure := lnwire.NewFailIncorrectDetails(
+		htlc.pd.Amount, uint32(hodlEvent.AcceptHeight),
+	)
 
+	l.sendHTLCError(
+		htlc.pd.HtlcIndex, failure, htlc.obfuscator,
+		htlc.pd.SourceRef,
+	)
 	return nil
 }
 
@@ -1264,7 +1274,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 		// arbitrary delays between the switch adding an ADD to the
 		// mailbox, and the HTLC being added to the commitment state.
 		if l.cfg.HodlMask.Active(hodl.AddOutgoing) {
-			l.warnf(hodl.AddOutgoing.Warning())
+			l.log.Warnf(hodl.AddOutgoing.Warning())
 			l.mailBox.AckPacket(pkt.inKey())
 			return
 		}
@@ -1281,7 +1291,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 			// The channels spare bandwidth is fully allocated, so
 			// we'll put this HTLC into the overflow queue.
 			case lnwallet.ErrMaxHTLCNumber:
-				l.infof("Downstream htlc add update with "+
+				l.log.Infof("downstream htlc add update with "+
 					"payment hash(%x) have been added to "+
 					"reprocessing queue, batch: %v",
 					htlc.PaymentHash[:],
@@ -1294,7 +1304,8 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 			// machine, as a result, we'll signal the switch to
 			// cancel the pending payment.
 			default:
-				l.warnf("Unable to handle downstream add HTLC: %v", err)
+				l.log.Warnf("unable to handle downstream add "+
+					"HTLC: %v", err)
 
 				var (
 					localFailure = false
@@ -1319,7 +1330,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 					var b bytes.Buffer
 					err := lnwire.EncodeFailure(&b, failure, 0)
 					if err != nil {
-						l.errorf("unable to encode failure: %v", err)
+						l.log.Errorf("unable to encode failure: %v", err)
 						l.mailBox.AckPacket(pkt.inKey())
 						return
 					}
@@ -1329,7 +1340,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 					var err error
 					reason, err = pkt.obfuscator.EncryptFirstHop(failure)
 					if err != nil {
-						l.errorf("unable to obfuscate error: %v", err)
+						l.log.Errorf("unable to obfuscate error: %v", err)
 						l.mailBox.AckPacket(pkt.inKey())
 						return
 					}
@@ -1364,7 +1375,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 			}
 		}
 
-		l.tracef("Received downstream htlc: payment_hash=%x, "+
+		l.log.Tracef("received downstream htlc: payment_hash=%x, "+
 			"local_log_index=%v, batch_size=%v",
 			htlc.PaymentHash[:], index, l.batchCounter+1)
 
@@ -1372,7 +1383,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 		pkt.outgoingHTLCID = index
 		htlc.ID = index
 
-		l.debugf("Queueing keystone of ADD open circuit: %s->%s",
+		l.log.Debugf("queueing keystone of ADD open circuit: %s->%s",
 			pkt.inKey(), pkt.outKey())
 
 		l.openedCircuits = append(l.openedCircuits, pkt.inKey())
@@ -1386,7 +1397,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 		// SETTLE to the mailbox, and the HTLC being added to the
 		// commitment state.
 		if l.cfg.HodlMask.Active(hodl.SettleOutgoing) {
-			l.warnf(hodl.SettleOutgoing.Warning())
+			l.log.Warnf(hodl.SettleOutgoing.Warning())
 			l.mailBox.AckPacket(pkt.inKey())
 			return
 		}
@@ -1403,7 +1414,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 			&inKey,
 		)
 		if err != nil {
-			l.errorf("unable to settle incoming HTLC for "+
+			l.log.Errorf("unable to settle incoming HTLC for "+
 				"circuit-key=%v: %v", inKey, err)
 
 			// If the HTLC index for Settle response was not known
@@ -1422,14 +1433,14 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 			return
 		}
 
-		l.debugf("Queueing removal of SETTLE closed circuit: %s->%s",
-			pkt.inKey(), pkt.outKey())
+		l.log.Debugf("queueing removal of SETTLE closed circuit: "+
+			"%s->%s", pkt.inKey(), pkt.outKey())
 
 		l.closedCircuits = append(l.closedCircuits, pkt.inKey())
 
 		// With the HTLC settled, we'll need to populate the wire
 		// message to target the specific channel and HTLC to be
-		// cancelled.
+		// canceled.
 		htlc.ChanID = l.ChanID()
 		htlc.ID = pkt.incomingHTLCID
 
@@ -1444,7 +1455,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 		// the mailbox, and the HTLC being added to the commitment
 		// state.
 		if l.cfg.HodlMask.Active(hodl.FailOutgoing) {
-			l.warnf(hodl.FailOutgoing.Warning())
+			l.log.Warnf(hodl.FailOutgoing.Warning())
 			l.mailBox.AckPacket(pkt.inKey())
 			return
 		}
@@ -1460,7 +1471,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 			&inKey,
 		)
 		if err != nil {
-			l.errorf("unable to cancel incoming HTLC for "+
+			l.log.Errorf("unable to cancel incoming HTLC for "+
 				"circuit-key=%v: %v", inKey, err)
 
 			// If the HTLC index for Fail response was not known to
@@ -1479,14 +1490,14 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 			return
 		}
 
-		l.debugf("Queueing removal of FAIL closed circuit: %s->%s",
+		l.log.Debugf("queueing removal of FAIL closed circuit: %s->%s",
 			pkt.inKey(), pkt.outKey())
 
 		l.closedCircuits = append(l.closedCircuits, pkt.inKey())
 
 		// With the HTLC removed, we'll need to populate the wire
 		// message to target the specific channel and HTLC to be
-		// cancelled. The "Reason" field will have already been set
+		// canceled. The "Reason" field will have already been set
 		// within the switch.
 		htlc.ChanID = l.ChanID()
 		htlc.ID = pkt.incomingHTLCID
@@ -1517,13 +1528,13 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 func (l *channelLink) cleanupSpuriousResponse(pkt *htlcPacket) {
 	inKey := pkt.inKey()
 
-	l.debugf("Cleaning up spurious response for incoming circuit-key=%v",
-		inKey)
+	l.log.Debugf("cleaning up spurious response for incoming "+
+		"circuit-key=%v", inKey)
 
 	// If the htlc packet doesn't have a source reference, it is unsafe to
 	// proceed, as skipping this ack may cause the htlc to be reforwarded.
 	if pkt.sourceRef == nil {
-		l.errorf("uanble to cleanup response for incoming "+
+		l.log.Errorf("uanble to cleanup response for incoming "+
 			"circuit-key=%v, does not contain source reference",
 			inKey)
 		return
@@ -1534,7 +1545,7 @@ func (l *channelLink) cleanupSpuriousResponse(pkt *htlcPacket) {
 	// of the incoming HTLC belonging to this link.
 	err := l.channel.AckAddHtlcs(*pkt.sourceRef)
 	if err != nil {
-		l.errorf("unable to ack AddRef for incoming "+
+		l.log.Errorf("unable to ack AddRef for incoming "+
 			"circuit-key=%v: %v", inKey, err)
 
 		// If this operation failed, it is unsafe to attempt removal of
@@ -1557,19 +1568,19 @@ func (l *channelLink) cleanupSpuriousResponse(pkt *htlcPacket) {
 	if pkt.destRef != nil {
 		err := l.channel.AckSettleFails(*pkt.destRef)
 		if err != nil {
-			l.errorf("unable to ack SettleFailRef "+
+			l.log.Errorf("unable to ack SettleFailRef "+
 				"for incoming circuit-key=%v: %v",
 				inKey, err)
 		}
 	}
 
-	l.debugf("Deleting circuit for incoming circuit-key=%x", inKey)
+	l.log.Debugf("deleting circuit for incoming circuit-key=%x", inKey)
 
 	// With all known references acked, we can now safely delete the circuit
 	// from the switch's circuit map, as the state is no longer needed.
 	err = l.cfg.Circuits.DeleteCircuits(inKey)
 	if err != nil {
-		l.errorf("unable to delete circuit for "+
+		l.log.Errorf("unable to delete circuit for "+
 			"circuit-key=%v: %v", inKey, err)
 	}
 }
@@ -1591,7 +1602,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 			return
 		}
 
-		l.tracef("Receive upstream htlc with payment hash(%x), "+
+		l.log.Tracef("receive upstream htlc with payment hash(%x), "+
 			"assigning index: %v", msg.PaymentHash[:], index)
 
 	case *lnwire.UpdateFulfillHTLC:
@@ -1644,7 +1655,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 				OnionSHA256: msg.ShaOnionBlob,
 			}
 		default:
-			log.Warnf("Unexpected failure code received in "+
+			l.log.Warnf("unexpected failure code received in "+
 				"UpdateFailMailformedHTLC: %v", msg.FailureCode)
 
 			// We don't just pass back the error we received from
@@ -1665,7 +1676,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		// form.
 		var b bytes.Buffer
 		if err := lnwire.EncodeFailure(&b, failure, 0); err != nil {
-			l.errorf("unable to encode malformed error: %v", err)
+			l.log.Errorf("unable to encode malformed error: %v", err)
 			return
 		}
 
@@ -1752,7 +1763,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		// state.
 		nextRevocation, currentHtlcs, err := l.channel.RevokeCurrentCommitment()
 		if err != nil {
-			log.Errorf("unable to revoke commitment: %v", err)
+			l.log.Errorf("unable to revoke commitment: %v", err)
 			return
 		}
 		l.cfg.Peer.SendMessage(false, nextRevocation)
@@ -1839,8 +1850,13 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 				return
 			}
 
+			chanType := l.channel.State().ChanType
+			isTweakless := chanType == channeldb.SingleFunderTweakless
+
 			chanID := l.ChanID()
-			err = l.cfg.TowerClient.BackupState(&chanID, breachInfo)
+			err = l.cfg.TowerClient.BackupState(
+				&chanID, breachInfo, isTweakless,
+			)
 			if err != nil {
 				l.fail(LinkFailureError{code: ErrInternalError},
 					"unable to queue breach backup: %v", err)
@@ -1879,16 +1895,11 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		// Error received from remote, MUST fail channel, but should
 		// only print the contents of the error message if all
 		// characters are printable ASCII.
-		errMsg := "non-ascii data"
-		if isASCII(msg.Data) {
-			errMsg = string(msg.Data)
-		}
 		l.fail(LinkFailureError{code: ErrRemoteError},
 			"ChannelPoint(%v): received error from peer: %v",
-			l.channel.ChannelPoint(), errMsg)
+			l.channel.ChannelPoint(), msg.Error())
 	default:
-		log.Warnf("ChannelPoint(%v): received unknown message of type %T",
-			l.channel.ChannelPoint(), msg)
+		l.log.Warnf("received unknown message of type %T", msg)
 	}
 
 }
@@ -1912,7 +1923,7 @@ func (l *channelLink) ackDownStreamPackets() error {
 			continue
 		}
 
-		l.debugf("removing Add packet %s from mailbox", inKey)
+		l.log.Debugf("removing Add packet %s from mailbox", inKey)
 		l.mailBox.AckPacket(inKey)
 	}
 
@@ -1926,7 +1937,7 @@ func (l *channelLink) ackDownStreamPackets() error {
 		// Successful deletion.
 
 	default:
-		l.errorf("unable to delete %d circuits: %v",
+		l.log.Errorf("unable to delete %d circuits: %v",
 			len(l.closedCircuits), err)
 		return err
 	}
@@ -1937,7 +1948,8 @@ func (l *channelLink) ackDownStreamPackets() error {
 	// the circuits must have been removed at some point, so it is now safe
 	// to un-queue the corresponding Settle/Fails.
 	for _, inKey := range l.closedCircuits {
-		l.debugf("removing Fail/Settle packet %s from mailbox", inKey)
+		l.log.Debugf("removing Fail/Settle packet %s from mailbox",
+			inKey)
 		l.mailBox.AckPacket(inKey)
 	}
 
@@ -1969,14 +1981,14 @@ func (l *channelLink) updateCommitTx() error {
 	// permits testing of either the switch or link's ability to trim
 	// circuits that have been opened, but unsuccessfully committed.
 	if l.cfg.HodlMask.Active(hodl.Commit) {
-		l.warnf(hodl.Commit.Warning())
+		l.log.Warnf(hodl.Commit.Warning())
 		return nil
 	}
 
 	theirCommitSig, htlcSigs, pendingHTLCs, err := l.channel.SignNextCommitment()
 	if err == lnwallet.ErrNoWindow {
-		l.tracef("revocation window exhausted, unable to send: %v, "+
-			"dangling_opens=%v, dangling_closes%v",
+		l.log.Tracef("revocation window exhausted, unable to send: "+
+			"%v, dangling_opens=%v, dangling_closes%v",
 			l.batchCounter, newLogClosure(func() string {
 				return spew.Sdump(l.openedCircuits)
 			}),
@@ -2070,14 +2082,14 @@ func (l *channelLink) UpdateShortChanID() (lnwire.ShortChannelID, error) {
 	// short channel ID.
 	err := l.channel.State().RefreshShortChanID()
 	if err != nil {
-		l.errorf("unable to refresh short_chan_id for chan_id=%v: %v",
-			chanID, err)
+		l.log.Errorf("unable to refresh short_chan_id for chan_id=%v: "+
+			"%v", chanID, err)
 		return hop.Source, err
 	}
 
 	sid := l.channel.ShortChanID()
 
-	l.infof("Updating to short_chan_id=%v for chan_id=%v", sid, chanID)
+	l.log.Infof("updating to short_chan_id=%v for chan_id=%v", sid, chanID)
 
 	l.Lock()
 	l.shortChanID = sid
@@ -2089,8 +2101,7 @@ func (l *channelLink) UpdateShortChanID() (lnwire.ShortChannelID, error) {
 			ShortChanID: sid,
 		})
 		if err != nil {
-			log.Errorf("Unable to update signals for "+
-				"ChannelLink(%v)", l)
+			l.log.Errorf("unable to update signals")
 		}
 	}()
 
@@ -2199,8 +2210,9 @@ func (l *channelLink) HtlcSatifiesPolicy(payHash [32]byte,
 	// any case, we'll cancel this HTLC.
 	actualFee := incomingHtlcAmt - amtToForward
 	if incomingHtlcAmt < amtToForward || actualFee < expectedFee {
-		l.errorf("outgoing htlc(%x) has insufficient fee: expected %v, "+
-			"got %v", payHash[:], int64(expectedFee), int64(actualFee))
+		l.log.Errorf("outgoing htlc(%x) has insufficient fee: "+
+			"expected %v, got %v",
+			payHash[:], int64(expectedFee), int64(actualFee))
 
 		// As part of the returned error, we'll send our latest routing
 		// policy so the sending node obtains the most up to date data.
@@ -2223,7 +2235,7 @@ func (l *channelLink) HtlcSatifiesPolicy(payHash [32]byte,
 	// sender messed up, or an intermediate node tampered with the HTLC.
 	timeDelta := policy.TimeLockDelta
 	if incomingTimeout < outgoingTimeout+timeDelta {
-		l.errorf("Incoming htlc(%x) has incorrect time-lock value: "+
+		l.log.Errorf("incoming htlc(%x) has incorrect time-lock value: "+
 			"expected at least %v block delta, got %v block delta",
 			payHash[:], timeDelta, incomingTimeout-outgoingTimeout)
 
@@ -2275,7 +2287,7 @@ func (l *channelLink) htlcSatifiesPolicyOutgoing(policy ForwardingPolicy,
 	// too small for the next hop. If so, then we'll cancel the HTLC
 	// directly.
 	if amt < policy.MinHTLC {
-		l.errorf("outgoing htlc(%x) is too small: min_htlc=%v, "+
+		l.log.Errorf("outgoing htlc(%x) is too small: min_htlc=%v, "+
 			"htlc_value=%v", payHash[:], policy.MinHTLC,
 			amt)
 
@@ -2297,7 +2309,7 @@ func (l *channelLink) htlcSatifiesPolicyOutgoing(policy ForwardingPolicy,
 	// Next, ensure that the passed HTLC isn't too large. If so, we'll cancel
 	// the HTLC directly.
 	if policy.MaxHTLC != 0 && amt > policy.MaxHTLC {
-		l.errorf("outgoing htlc(%x) is too large: max_htlc=%v, "+
+		l.log.Errorf("outgoing htlc(%x) is too large: max_htlc=%v, "+
 			"htlc_value=%v", payHash[:], policy.MaxHTLC, amt)
 
 		// As part of the returned error, we'll send our latest routing policy
@@ -2317,7 +2329,7 @@ func (l *channelLink) htlcSatifiesPolicyOutgoing(policy ForwardingPolicy,
 	// future, so we'll reject an HTLC if the outgoing expiration time is
 	// too close to the current height.
 	if timeout <= heightNow+l.cfg.OutgoingCltvRejectDelta {
-		l.errorf("htlc(%x) has an expiry that's too soon: "+
+		l.log.Errorf("htlc(%x) has an expiry that's too soon: "+
 			"outgoing_expiry=%v, best_height=%v", payHash[:],
 			timeout, heightNow)
 
@@ -2336,8 +2348,8 @@ func (l *channelLink) htlcSatifiesPolicyOutgoing(policy ForwardingPolicy,
 
 	// Check absolute max delta.
 	if timeout > l.cfg.MaxOutgoingCltvExpiry+heightNow {
-		l.errorf("outgoing htlc(%x) has a time lock too far in the "+
-			"future: got %v, but maximum is %v", payHash[:],
+		l.log.Errorf("outgoing htlc(%x) has a time lock too far in "+
+			"the future: got %v, but maximum is %v", payHash[:],
 			timeout-heightNow, l.cfg.MaxOutgoingCltvExpiry)
 
 		return &lnwire.FailExpiryTooFar{}
@@ -2370,7 +2382,7 @@ func (l *channelLink) String() string {
 //
 // NOTE: Part of the ChannelLink interface.
 func (l *channelLink) HandleSwitchPacket(pkt *htlcPacket) error {
-	l.tracef("received switch packet inkey=%v, outkey=%v",
+	l.log.Tracef("received switch packet inkey=%v, outkey=%v",
 		pkt.inKey(), pkt.outKey())
 
 	l.mailBox.AddPacket(pkt)
@@ -2389,14 +2401,12 @@ func (l *channelLink) HandleChannelUpdate(message lnwire.Message) {
 // committing to an update_fee message.
 func (l *channelLink) updateChannelFee(feePerKw lnwallet.SatPerKWeight) error {
 
-	log.Infof("ChannelPoint(%v): updating commit fee to %v sat/kw", l,
-		feePerKw)
+	l.log.Infof("updating commit fee to %v sat/kw", feePerKw)
 
 	// We skip sending the UpdateFee message if the channel is not
 	// currently eligible to forward messages.
 	if !l.EligibleToForward() {
-		log.Debugf("ChannelPoint(%v): skipping fee update for "+
-			"inactive channel", l.ChanID())
+		l.log.Debugf("skipping fee update for inactive channel")
 		return nil
 	}
 
@@ -2426,8 +2436,7 @@ func (l *channelLink) processRemoteSettleFails(fwdPkg *channeldb.FwdPkg,
 		return
 	}
 
-	log.Debugf("ChannelLink(%v): settle-fail-filter %v",
-		l.ShortChanID(), fwdPkg.SettleFailFilter)
+	l.log.Debugf("settle-fail-filter %v", fwdPkg.SettleFailFilter)
 
 	var switchPackets []*htlcPacket
 	for i, pd := range settleFails {
@@ -2451,7 +2460,7 @@ func (l *channelLink) processRemoteSettleFails(fwdPkg *channeldb.FwdPkg,
 			// forward the SETTLE to the switch and will not signal
 			// a free slot on the commitment transaction.
 			if l.cfg.HodlMask.Active(hodl.SettleIncoming) {
-				l.warnf(hodl.SettleIncoming.Warning())
+				l.log.Warnf(hodl.SettleIncoming.Warning())
 				continue
 			}
 
@@ -2479,11 +2488,11 @@ func (l *channelLink) processRemoteSettleFails(fwdPkg *channeldb.FwdPkg,
 			// forward the FAIL to the switch and will not signal a
 			// free slot on the commitment transaction.
 			if l.cfg.HodlMask.Active(hodl.FailIncoming) {
-				l.warnf(hodl.FailIncoming.Warning())
+				l.log.Warnf(hodl.FailIncoming.Warning())
 				continue
 			}
 
-			// Fetch the reason the HTLC was cancelled so we can
+			// Fetch the reason the HTLC was canceled so we can
 			// continue to propagate it.
 			failPacket := &htlcPacket{
 				outgoingChanID: l.ShortChanID(),
@@ -2531,7 +2540,7 @@ func (l *channelLink) processRemoteSettleFails(fwdPkg *channeldb.FwdPkg,
 func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 	lockedInHtlcs []*lnwallet.PaymentDescriptor) bool {
 
-	l.tracef("processing %d remote adds for height %d",
+	l.log.Tracef("processing %d remote adds for height %d",
 		len(lockedInHtlcs), fwdPkg.Height)
 
 	decodeReqs := make(
@@ -2613,7 +2622,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 				onionBlob[:], pd.SourceRef)
 			needUpdate = true
 
-			log.Errorf("unable to decode onion hop "+
+			l.log.Errorf("unable to decode onion hop "+
 				"iterator: %v", failureCode)
 			continue
 		}
@@ -2632,7 +2641,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 			)
 			needUpdate = true
 
-			log.Errorf("unable to decode onion "+
+			l.log.Errorf("unable to decode onion "+
 				"obfuscator: %v", failureCode)
 			continue
 		}
@@ -2644,7 +2653,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 			// If we're unable to process the onion payload, or we
 			// we received malformed TLV stream, then we should
 			// send an error back to the caller so the HTLC can be
-			// cancelled.
+			// canceled.
 			l.sendHTLCError(
 				pd.HtlcIndex,
 				lnwire.NewInvalidOnionVersion(onionBlob[:]),
@@ -2652,7 +2661,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 			)
 			needUpdate = true
 
-			log.Errorf("Unable to decode forwarding "+
+			l.log.Errorf("unable to decode forwarding "+
 				"instructions: %v", err)
 			continue
 		}
@@ -2681,7 +2690,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 			// validate the forwarded ADD, nor will we send the
 			// packet to the htlc switch.
 			if l.cfg.HodlMask.Active(hodl.AddIncoming) {
-				l.warnf(hodl.AddIncoming.Warning())
+				l.log.Warnf(hodl.AddIncoming.Warning())
 				continue
 			}
 
@@ -2752,7 +2761,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 			buf := bytes.NewBuffer(addMsg.OnionBlob[0:0])
 			err := chanIterator.EncodeNextHop(buf)
 			if err != nil {
-				log.Errorf("unable to encode the "+
+				l.log.Errorf("unable to encode the "+
 					"remaining route %v", err)
 
 				var failure lnwire.FailureMessage
@@ -2818,7 +2827,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 		return needUpdate
 	}
 
-	l.debugf("forwarding %d packets to switch", len(switchPackets))
+	l.log.Debugf("forwarding %d packets to switch", len(switchPackets))
 
 	// NOTE: This call is made synchronous so that we ensure all circuits
 	// are committed in the exact order that they are processed in the link.
@@ -2840,7 +2849,7 @@ func (l *channelLink) processExitHop(pd *lnwallet.PaymentDescriptor,
 	// ADD, nor will we settle the corresponding invoice or respond with the
 	// preimage.
 	if l.cfg.HodlMask.Active(hodl.ExitSettle) {
-		l.warnf(hodl.ExitSettle.Warning())
+		l.log.Warnf(hodl.ExitSettle.Warning())
 
 		return false, nil
 	}
@@ -2850,7 +2859,7 @@ func (l *channelLink) processExitHop(pd *lnwallet.PaymentDescriptor,
 	// matches the HTLC we were extended.
 	if pd.Amount != fwdInfo.AmountToForward {
 
-		log.Errorf("Onion payload of incoming htlc(%x) has incorrect "+
+		l.log.Errorf("onion payload of incoming htlc(%x) has incorrect "+
 			"value: expected %v, got %v", pd.RHash,
 			pd.Amount, fwdInfo.AmountToForward)
 
@@ -2863,7 +2872,7 @@ func (l *channelLink) processExitHop(pd *lnwallet.PaymentDescriptor,
 	// We'll also ensure that our time-lock value has been computed
 	// correctly.
 	if pd.Timeout != fwdInfo.OutgoingCTLV {
-		log.Errorf("Onion payload of incoming htlc(%x) has incorrect "+
+		l.log.Errorf("onion payload of incoming htlc(%x) has incorrect "+
 			"time-lock: expected %v, got %v",
 			pd.RHash[:], pd.Timeout, fwdInfo.OutgoingCTLV)
 
@@ -2892,7 +2901,7 @@ func (l *channelLink) processExitHop(pd *lnwallet.PaymentDescriptor,
 
 	// Cancel htlc if we don't have an invoice for it.
 	case channeldb.ErrInvoiceNotFound:
-		failure := lnwire.NewFailIncorrectDetails(pd.Amount)
+		failure := lnwire.NewFailIncorrectDetails(pd.Amount, heightNow)
 		l.sendHTLCError(pd.HtlcIndex, failure, obfuscator, pd.SourceRef)
 
 		return true, nil
@@ -2913,8 +2922,7 @@ func (l *channelLink) processExitHop(pd *lnwallet.PaymentDescriptor,
 
 	if event == nil {
 		// Save payment descriptor for future reference.
-		hodlHtlcs := l.hodlMap[invoiceHash]
-		l.hodlMap[invoiceHash] = append(hodlHtlcs, htlc)
+		l.hodlMap[circuitKey] = htlc
 
 		return false, nil
 	}
@@ -2933,7 +2941,7 @@ func (l *channelLink) settleHTLC(preimage lntypes.Preimage, htlcIndex uint64,
 
 	hash := preimage.Hash()
 
-	l.infof("settling htlc %v as exit hop", hash)
+	l.log.Infof("settling htlc %v as exit hop", hash)
 
 	err := l.channel.SettleHTLC(
 		preimage, htlcIndex, sourceRef, nil, nil,
@@ -2945,7 +2953,7 @@ func (l *channelLink) settleHTLC(preimage lntypes.Preimage, htlcIndex uint64,
 	// If the link is in hodl.BogusSettle mode, replace the preimage with a
 	// fake one before sending it to the peer.
 	if l.cfg.HodlMask.Active(hodl.BogusSettle) {
-		l.warnf(hodl.BogusSettle.Warning())
+		l.log.Warnf(hodl.BogusSettle.Warning())
 		preimage = [32]byte{}
 		copy(preimage[:], bytes.Repeat([]byte{2}, 32))
 	}
@@ -2996,7 +3004,7 @@ func (l *channelLink) handleBatchFwdErrs(errChan chan error) {
 			continue
 		}
 
-		l.errorf("unhandled error while forwarding htlc packet over "+
+		l.log.Errorf("unhandled error while forwarding htlc packet over "+
 			"htlcswitch: %v", err)
 	}
 }
@@ -3008,13 +3016,13 @@ func (l *channelLink) sendHTLCError(htlcIndex uint64, failure lnwire.FailureMess
 
 	reason, err := e.EncryptFirstHop(failure)
 	if err != nil {
-		log.Errorf("unable to obfuscate error: %v", err)
+		l.log.Errorf("unable to obfuscate error: %v", err)
 		return
 	}
 
 	err = l.channel.FailHTLC(htlcIndex, reason, sourceRef, nil, nil)
 	if err != nil {
-		log.Errorf("unable cancel htlc: %v", err)
+		l.log.Errorf("unable cancel htlc: %v", err)
 		return
 	}
 
@@ -3033,7 +3041,7 @@ func (l *channelLink) sendMalformedHTLCError(htlcIndex uint64,
 	shaOnionBlob := sha256.Sum256(onionBlob)
 	err := l.channel.MalformedFailHTLC(htlcIndex, code, shaOnionBlob, sourceRef)
 	if err != nil {
-		log.Errorf("unable cancel htlc: %v", err)
+		l.log.Errorf("unable cancel htlc: %v", err)
 		return
 	}
 
@@ -3056,58 +3064,15 @@ func (l *channelLink) fail(linkErr LinkFailureError,
 
 	// Return if we have already notified about a failure.
 	if l.failed {
-		l.warnf("Ignoring link failure (%v), as link already failed",
-			reason)
+		l.log.Warnf("ignoring link failure (%v), as link already "+
+			"failed", reason)
 		return
 	}
 
-	l.errorf("Failing link: %s", reason)
+	l.log.Errorf("failing link: %s", reason)
 
 	// Set failed, such that we won't process any more updates, and notify
 	// the peer about the failure.
 	l.failed = true
 	l.cfg.OnChannelFailure(l.ChanID(), l.ShortChanID(), linkErr)
-}
-
-// infof prefixes the channel's identifier before printing to info log.
-func (l *channelLink) infof(format string, a ...interface{}) {
-	msg := fmt.Sprintf(format, a...)
-	log.Infof("ChannelLink(%s) %s", l.ShortChanID(), msg)
-}
-
-// debugf prefixes the channel's identifier before printing to debug log.
-func (l *channelLink) debugf(format string, a ...interface{}) {
-	msg := fmt.Sprintf(format, a...)
-	log.Debugf("ChannelLink(%s) %s", l.ShortChanID(), msg)
-}
-
-// warnf prefixes the channel's identifier before printing to warn log.
-func (l *channelLink) warnf(format string, a ...interface{}) {
-	msg := fmt.Sprintf(format, a...)
-	log.Warnf("ChannelLink(%s) %s", l.ShortChanID(), msg)
-}
-
-// errorf prefixes the channel's identifier before printing to error log.
-func (l *channelLink) errorf(format string, a ...interface{}) {
-	msg := fmt.Sprintf(format, a...)
-	log.Errorf("ChannelLink(%s) %s", l.ShortChanID(), msg)
-}
-
-// tracef prefixes the channel's identifier before printing to trace log.
-func (l *channelLink) tracef(format string, a ...interface{}) {
-	msg := fmt.Sprintf(format, a...)
-	log.Tracef("ChannelLink(%s) %s", l.ShortChanID(), msg)
-}
-
-// isASCII is a helper method that checks whether all bytes in `data` would be
-// printable ASCII characters if interpreted as a string.
-func isASCII(data []byte) bool {
-	isASCII := true
-	for _, c := range data {
-		if c < 32 || c > 126 {
-			isASCII = false
-			break
-		}
-	}
-	return isASCII
 }
